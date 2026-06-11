@@ -1,0 +1,28 @@
+# Core dependencies
+numpy>=1.21.0,<2
+opencv-python>=4.5.0
+torch>=2.0.0
+scipy>=1.7.0
+
+# Medical imaging
+pydicom>=2.3.0
+pynetdicom>=2.0.0
+nibabel>=5.0.0
+segmentation-models-pytorch
+
+# Image processing
+Pillow>=9.0.0
+
+# GPU acceleration (requires CUDA toolkit)
+cupy-cuda12x
+
+# Cryptography
+pycryptodome>=3.15.0
+
+# Utilities
+natsort>=8.0.0
+
+# Note: For CuPy, you need to install the correct version for your CUDA toolkit:
+# - cupy-cuda11x for CUDA 11.x
+# - cupy-cuda12x for CUDA 12.x
+# - Or install with: pip install cupy-cuda11x (replace 11x with your CUDA version)
