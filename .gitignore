@@ -1,0 +1,6 @@
+outputs/
+outputs_oriented/
+US_images/
+.env
+__pycache__/
+*.pyc

@@ -52,28 +52,33 @@ def prepare_image_batch(images, target_size=256):
         prepared.append(img)
     return np.stack(prepared)
 
-def run_inference_batch(model, images, device, target_size=256):
-    """Run inference on all images at once"""
-    prepared = prepare_image_batch(images, target_size)
-    input_tensor = torch.from_numpy(prepared).unsqueeze(1).float().to(device)
-    
-    with torch.no_grad():
-        output = model(input_tensor)
-        if output.shape[1] > 1:
-            probs = torch.softmax(output, dim=1).cpu().numpy()
-            pred_masks = np.argmax(probs, axis=1).astype(np.uint8)
-            confidence_maps = np.max(probs, axis=1)
-        else:
-            probs = torch.sigmoid(output).squeeze(1).cpu().numpy()
-            pred_masks = (probs > 0.5).astype(np.uint8)
-            confidence_maps = probs
-    
+def run_inference_batch(model, images, device, target_size=256, batch_size=32):
+    """Run inference in chunks — a full sweep (~300 frames) in one batch
+    overflows an 8GB GPU's activation memory."""
+    mask_chunks = []
+    conf_chunks = []
+    for start in range(0, len(images), batch_size):
+        prepared = prepare_image_batch(images[start:start + batch_size], target_size)
+        input_tensor = torch.from_numpy(prepared).unsqueeze(1).float().to(device)
+
+        with torch.no_grad():
+            output = model(input_tensor)
+            if output.shape[1] > 1:
+                probs = torch.softmax(output, dim=1).cpu().numpy()
+                mask_chunks.append(np.argmax(probs, axis=1).astype(np.uint8))
+                conf_chunks.append(np.max(probs, axis=1))
+            else:
+                probs = torch.sigmoid(output).squeeze(1).cpu().numpy()
+                mask_chunks.append((probs > 0.5).astype(np.uint8))
+                conf_chunks.append(probs)
+
+        del input_tensor, output
+
     # Free GPU memory
-    del input_tensor, output
     torch.cuda.empty_cache()
     cp.get_default_memory_pool().free_all_blocks()
-    
-    return pred_masks, confidence_maps
+
+    return np.concatenate(mask_chunks), np.concatenate(conf_chunks)
 
 def get_bounds(a):
     """Fast bounds calculation using CuPy"""
@@ -108,24 +113,42 @@ def process_images(r_d, img_array=None, flist=None):
     """Process images and run inference"""
     print("\nProcessing images for inference...")
     # Use actual_dir if provided, otherwise try to find it
-    if 'actual_dir' in r_d:
-        fpath = f'{mdir}/{r_d["patientid"]}/{r_d["studyid"]}/{r_d["actual_dir"]}/'
+    base_study = f'{mdir}/{r_d["patientid"]}/{r_d["studyid"]}'
+    orient = r_d.get("orientation", "transverse")
+
+    if 'actual_dir' in r_d and isinstance(r_d['actual_dir'], str) and r_d['actual_dir']:
+        fpath = f'{base_study}/{r_d["actual_dir"]}/'
     else:
-        # Fallback: try multiple patterns - raw_ prefix and without prefix
-        patterns = [
-            f'raw_{r_d["side"]}{r_d["target"]}_{r_d["orientation"]}',
-            f'{r_d["side"]}{r_d["target"]}_{r_d["orientation"]}',
-            f'raw_{r_d["target"]}_{r_d["orientation"]}',
-            f'{r_d["target"]}_{r_d["orientation"]}'
-        ]
+        # The second axis goes by several names depending on app version/organ
+        if orient in ('sagital', 'sagittal', 'longitudinal'):
+            orient_aliases = [orient] + [a for a in ('sagital', 'sagittal', 'longitudinal') if a != orient]
+        else:
+            orient_aliases = [orient]
+
+        # Try new layout first: {orientation}/raw/
         fpath = None
-        for pattern in patterns:
-            test_path = f'{mdir}/{r_d["patientid"]}/{r_d["studyid"]}/{pattern}/'
-            if os.path.isdir(test_path):
-                fpath = test_path
+        for o in orient_aliases:
+            new_layout = f'{base_study}/{o}/raw/'
+            if os.path.isdir(new_layout):
+                fpath = new_layout
                 break
         if fpath is None:
-            fpath = f'{mdir}/{r_d["patientid"]}/{r_d["studyid"]}/raw_{r_d["side"]}{r_d["target"]}_{r_d["orientation"]}/'
+            # Fallback: legacy raw_ prefix patterns
+            patterns = []
+            for o in orient_aliases:
+                patterns += [
+                    f'raw_{r_d["side"]}{r_d["target"]}_{o}',
+                    f'{r_d["side"]}{r_d["target"]}_{o}',
+                    f'raw_{r_d["target"]}_{o}',
+                    f'{r_d["target"]}_{o}'
+                ]
+            for pattern in patterns:
+                test_path = f'{base_study}/{pattern}/'
+                if os.path.isdir(test_path):
+                    fpath = test_path
+                    break
+            if fpath is None:
+                fpath = f'{base_study}/raw_{r_d["side"]}{r_d["target"]}_{orient}/'
     print(r_d)
     print(fpath)
     target_list = procedure_list[r_d["target"]]
@@ -148,7 +171,19 @@ def process_images(r_d, img_array=None, flist=None):
         
         if not valid_imgs:
             raise RuntimeError(f"No valid images for {r_d}")
-        
+
+        # The probe stream can change resolution mid-sweep (depth/view change),
+        # but np.stack and the volume builder need uniform frames — resize
+        # outliers to the sweep's dominant size
+        from collections import Counter
+        shape_counts = Counter(im.shape[:2] for im in valid_imgs)
+        target_hw = shape_counts.most_common(1)[0][0]
+        if len(shape_counts) > 1:
+            print(f"Mixed frame sizes {dict(shape_counts)} — resizing all to {target_hw}")
+            valid_imgs = [im if im.shape[:2] == target_hw
+                          else cv2.resize(im, (target_hw[1], target_hw[0]))
+                          for im in valid_imgs]
+
         img_array = np.stack(valid_imgs)
     else:
         if isinstance(img_array, np.ndarray) and img_array.ndim == 4:
@@ -233,8 +268,10 @@ def place_slice_in_volume(points, image_array, theta, center_x, center_y, center
         # No rotation case
         y_coords, x_coords = cp.where(mask)
         pixel_values = image_array_gpu[mask]
-        
-        if orientation == 'sagital':
+
+        # Any non-transverse sweep (sagital/sagittal/longitudinal) uses the
+        # sagittal placement geometry
+        if orientation != 'transverse':
             vol_x = cp.full_like(x_coords, center_x)
             vol_y = y_coords
             vol_z = x_coords
@@ -262,8 +299,8 @@ def place_slice_in_volume(points, image_array, theta, center_x, center_y, center
         x_coords_3d = x1[mask]
         z_coords_3d = z1[mask]
         pixel_values = image_array_gpu[mask]
-        
-        if orientation == 'sagital':
+
+        if orientation != 'transverse':
             vol_x = (z_coords_3d + center_x).astype(cp.int32)
             vol_y = y_coords.astype(cp.int32)
             vol_z = (x_coords_3d + center_z).astype(cp.int32)
@@ -290,6 +327,20 @@ def place_slice_in_volume(points, image_array, theta, center_x, center_y, center
     
     # Update volume
     points[vol_x_cpu, vol_y_cpu, vol_z_cpu] = np.maximum(points[vol_x_cpu, vol_y_cpu, vol_z_cpu], pixel_values_cpu)
+
+def orient_apex_on_top(volume_np):
+    """Ensure the probe-apex axis sits at the top of the saved volume.
+
+    The rebuild fans slices around the apex; depending on sweep direction the apex
+    can land at either end of Z. The fan cross-section grows from apex (narrow) to
+    base (wide), so the Z-half with fewer populated voxels is the apex end. Flip Z
+    only when that apex end is at the bottom.
+    """
+    counts = (volume_np > 0).sum(axis=(0, 1))
+    half = len(counts) // 2
+    if counts[:half].sum() < counts[half:].sum():  # apex (narrow end) at bottom
+        return np.ascontiguousarray(volume_np[:, :, ::-1])
+    return volume_np
 
 def get_voxel(patient_data, r_d, img_array, flist):
     """Create 3D volume from 2D slices - CuPy accelerated"""
@@ -360,8 +411,17 @@ def get_voxel(patient_data, r_d, img_array, flist):
         print("Quick gap fill with CuPy (chunked processing)...")
         max_iter = 5
         
-        # Determine chunk size based on volume size to stay under ~2GB per chunk
-        chunk_size = min(200, points.shape[2])  # Process in Z-axis slices
+        # Size chunks from actual free VRAM: each z-slice needs roughly
+        # 12 bytes/voxel across points/sums/counts + astype temporaries.
+        # (A fixed 200 was tuned for a 16GB card and OOMs on 8GB.)
+        try:
+            free_b, _total_b = cp.cuda.Device().mem_info
+            bytes_per_slice = points.shape[0] * points.shape[1] * 12
+            chunk_size = max(16, min(200, int(free_b * 0.5 / bytes_per_slice)))
+        except Exception:
+            chunk_size = 64
+        chunk_size = min(chunk_size, points.shape[2])
+        print(f"Gap fill chunk size: {chunk_size} slices")
         num_chunks = (points.shape[2] + chunk_size - 1) // chunk_size
         
         for it in range(max_iter):
@@ -427,9 +487,13 @@ def get_voxel(patient_data, r_d, img_array, flist):
     mask = points > 0
     blurred = gaussian_filter(points.astype(np.float32), sigma=0.8)
     points = np.where(mask, blurred, 0).astype(np.uint8)
-    
+
+    # The fan apex (probe axis) comes out at the bottom — flip so it sits on top.
+    print("Orienting probe-apex axis to top...")
+    points = orient_apex_on_top(points)
+
     # Save
-    output_path = f"{odir}/{r_d['patientid']}_{r_d['studyid']}_{r_d['side']}{r_d['target']}_{orientation}_riv3.nii"
+    output_path = f"{odir}/{r_d['patientid']}_{r_d['studyid']}_{r_d['side']}{r_d['target']}_{orientation}_riv3.nii.gz"
     print(f"Saving to {output_path}")
     nii = nib.Nifti1Image(points, affine=np.eye(4))
     nib.save(nii, output_path)
@@ -441,7 +505,7 @@ def get_voxel(patient_data, r_d, img_array, flist):
     print("GPU memory cleared")
 
 def process_study(r_common):
-    """Process a single study - transverse and sagittal"""
+    """Process a single study - transverse and sagital"""
     patient_id = r_common["patientid"]
     study_id = r_common["studyid"]
     target = r_common["target"]
@@ -451,15 +515,24 @@ def process_study(r_common):
     print(f"Processing {patient_id}/{study_id}/{side}{target}")
     print(f"{'='*60}")
     
-    # Sagittal
-    print("\n--- SAGITTAL ---")
+    # Second axis: "sagital" for pelvic organs, "longitudinal" for kidneys.
+    # The label drives the output filename; geometry treats anything
+    # non-transverse as a sagittal-style sweep.
+    second_axis = r_common.get('second_axis') or 'sagital'
+    print(f"\n--- {second_axis.upper()} ---")
     r_s = r_common.copy()
-    r_s["orientation"] = "sagital"
+    r_s["orientation"] = second_axis
     if 'sagital_dir' in r_common:
         r_s['actual_dir'] = r_common['sagital_dir']
-    print('starting process_images for sagittal...')
-    contiguous_segments_sag, max_bbox_sag, img_array_sag, files_sag = process_images(r_s)
-    
+    print('starting process_images for sagital...')
+    # A sweep can be missing entirely when an upload died mid-session —
+    # reconstruct whatever orientations actually arrived instead of aborting
+    try:
+        contiguous_segments_sag, max_bbox_sag, img_array_sag, files_sag = process_images(r_s)
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"⚠ {second_axis} sweep unavailable ({e}) — continuing without it")
+        contiguous_segments_sag, max_bbox_sag, img_array_sag, files_sag = [], {}, None, []
+
     default_x = img_array_sag.shape[0] // 2 if img_array_sag is not None else 256
     default_y = img_array_sag.shape[1] // 2 if img_array_sag is not None else 256
     indices_sag = {max_bbox_sag.get("target", 1): {
@@ -468,20 +541,26 @@ def process_study(r_common):
         "y2": max_bbox_sag.get("y_max", default_y),
         "x2": max_bbox_sag.get("x_max", default_x)
     }}
-    
+
     # Transverse
     print("\n--- TRANSVERSE ---")
     r_t = r_common.copy()
     r_t["orientation"] = "transverse"
     if 'transverse_dir' in r_common:
         r_t['actual_dir'] = r_common['transverse_dir']
-    contiguous_segments_trans, max_bbox_trans, img_array_trans, files_trans = process_images(r_t)
-    
+    try:
+        contiguous_segments_trans, max_bbox_trans, img_array_trans, files_trans = process_images(r_t)
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"⚠ transverse sweep unavailable ({e}) — continuing without it")
+        contiguous_segments_trans, max_bbox_trans, img_array_trans, files_trans = [], {}, None, []
+
     if contiguous_segments_trans:
         longest = max(contiguous_segments_trans, key=len)
         transverse_stats = {"min": longest[0], "max": longest[-1]}
-    else:
+    elif len(files_trans):
         transverse_stats = {"min": files_trans[0], "max": files_trans[-1]}
+    else:
+        transverse_stats = {}
     
     # Setup indices
     if "studies" not in r_common:
@@ -491,12 +570,18 @@ def process_study(r_common):
     r_common["studies"][study_id]["indices"] = indices_sag
     r_common["studies"][study_id]["transverse_stats"] = transverse_stats
     
-    # Generate volumes
-    print("\n--- GENERATING TRANSVERSE VOLUME ---")
-    get_voxel(r_common, r_t, img_array_trans, files_trans)
-    
-    print("\n--- GENERATING SAGITTAL VOLUME ---")
-    get_voxel(r_common, r_s, img_array_sag, files_sag)
+    # Generate volumes for whichever sweeps are present
+    if img_array_trans is not None and len(files_trans):
+        print("\n--- GENERATING TRANSVERSE VOLUME ---")
+        get_voxel(r_common, r_t, img_array_trans, files_trans)
+    else:
+        print("\n(no transverse sweep — skipping transverse volume)")
+
+    if img_array_sag is not None and len(files_sag):
+        print(f"\n--- GENERATING {second_axis.upper()} VOLUME ---")
+        get_voxel(r_common, r_s, img_array_sag, files_sag)
+    else:
+        print(f"\n(no {second_axis} sweep — skipping {second_axis} volume)")
     
     # Final cleanup after entire study
     cp.get_default_memory_pool().free_all_blocks()
@@ -526,21 +611,27 @@ def process_all_patients(base_dir=mdir):
             print(f"\nChecking patient={patient_id} study={study_id}")
             
             # Find actual directories in study path
-            all_dirs = [d for d in os.listdir(study_path) 
+            all_dirs = [d for d in os.listdir(study_path)
                        if os.path.isdir(os.path.join(study_path, d))]
-            
-            # Filter to both raw_ prefixed and non-prefixed directories (skip processed_)
-            raw_dirs = [d for d in all_dirs if 'processed' not in d and 
+
+            # --- New layout: {orientation}/raw/ or {orientation}/processed/ ---
+            new_orientations = {}
+            for d in all_dirs:
+                raw_sub = os.path.join(study_path, d, 'raw')
+                proc_sub = os.path.join(study_path, d, 'processed')
+                if os.path.isdir(raw_sub) or os.path.isdir(proc_sub):
+                    low = d.lower()
+                    if 'sagital' in low:
+                        new_orientations.setdefault('sagital', True)
+                    elif 'transverse' in low:
+                        new_orientations.setdefault('transverse', True)
+
+            # --- Legacy layout: raw_{side}{target}_{orientation} ---
+            raw_dirs = [d for d in all_dirs if 'processed' not in d and
                        (d.startswith('raw_') or any(x in d for x in ['kidney', 'prostate', 'bladder']))]
-            
-            # Group by target/side combination
             studies_found = {}
             for d in raw_dirs:
-                # Parse directory name: [raw_]{side}{target}_{orientation}[_number]
-                # Remove raw_ prefix if present
                 clean = d.replace('raw_', '') if d.startswith('raw_') else d
-                
-                # Determine orientation
                 if '_sagital' in clean:
                     orientation = 'sagital'
                     prefix = clean.split('_sagital')[0]
@@ -549,12 +640,8 @@ def process_all_patients(base_dir=mdir):
                     prefix = clean.split('_transverse')[0]
                 else:
                     continue
-                
-                # Skip if not relevant anatomy
                 if 'kidney' not in prefix and 'prostate' not in prefix and 'bladder' not in prefix:
                     continue
-                
-                # Track this combination
                 if prefix not in studies_found:
                     studies_found[prefix] = {'sagital': [], 'transverse': []}
                 studies_found[prefix][orientation].append(d)
@@ -577,7 +664,7 @@ def process_all_patients(base_dir=mdir):
                     side = ''
                 
                 # Check if already processed
-                if os.path.exists(f"{odir}/{patient_id}_{study_id}_{side}{target}_sagital_riv3.nii"):
+                if os.path.exists(f"{odir}/{patient_id}_{study_id}_{side}{target}_sagital_riv3.nii.gz"):
                     #print(f"Already exists: {patient_id}_{study_id}_{side}{target}_sagital, skipping.")
                     continue
                 
@@ -617,6 +704,51 @@ def process_all_patients(base_dir=mdir):
                 r_common['transverse_dir'] = transverse_dir
                 
                 # Process this study
+                try:
+                    process_study(r_common)
+                except Exception as e:
+                    print(f"ERROR processing {patient_id}/{study_id}/{side}{target}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # --- New layout: {orientation}/raw/ — derive target from metadata ---
+            if not studies_found and new_orientations:
+                info_path = os.path.join(study_path, "study_info.json")
+                if not os.path.isfile(info_path):
+                    continue
+                info = json.loads(open(info_path).read())
+                organ = info.get('organ', 'prostate').lower()
+                if 'kidney' in organ:
+                    target = 'kidney'
+                elif 'bladder' in organ or 'postvoid' in organ:
+                    target = 'bladder'
+                else:
+                    target = 'prostatebladder'
+                side = ''
+                if 'left' in organ:
+                    side = 'left_'
+                elif 'right' in organ:
+                    side = 'right_'
+
+                out_sag = f"{odir}/{patient_id}_{study_id}_{side}{target}_sagital_riv3.nii.gz"
+                if os.path.exists(out_sag):
+                    continue
+
+                r_common = {
+                    'patientid': patient_id,
+                    'studyid': study_id,
+                    'target': target,
+                    'side': side,
+                    'studies': {},
+                }
+                # Pass actual orientation dir names so process_images finds them
+                for d in all_dirs:
+                    low = d.lower()
+                    if 'sagital' in low and os.path.isdir(os.path.join(study_path, d, 'raw')):
+                        r_common['sagital_dir'] = f'{d}/raw'
+                    elif 'transverse' in low and os.path.isdir(os.path.join(study_path, d, 'raw')):
+                        r_common['transverse_dir'] = f'{d}/raw'
+
                 try:
                     process_study(r_common)
                 except Exception as e:

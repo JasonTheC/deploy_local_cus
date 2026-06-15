@@ -5,16 +5,33 @@ services:
     container_name: cus-backend
     ports:
       - "8890:8890"
+      - "7556:7556"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-2}
+      - MAX_QUEUE_SIZE=${MAX_QUEUE_SIZE:-16}
+      - PACS_TCP_PORT=8890
+      - PACS_WS_PORT=7556
+      # ── Primary PACS (the local Orthanc container) ──────────
+      - PACS_HOST=orthanc
+      - PACS_PORT=4242
+      - PACS_AET=ORTHANC
+      # ── Fallback PACS nodes (for redundancy / 28yr retention) ─
+      # Every study is C-STORE'd to ALL nodes below. A study is only
+      # marked "sent" once every node confirms storage, so a node that
+      # is briefly offline gets retried automatically by the janitor.
+      # To add a site, uncomment a block and fill in its IP / port / AE
+      # title. PACS2_PORT/AET default to 104 / ORTHANC if omitted.
+      - PACS2_HOST=${PACS2_HOST:-}
+      - PACS2_PORT=${PACS2_PORT:-104}
+      - PACS2_AET=${PACS2_AET:-ORTHANC}
+      - PACS3_HOST=${PACS3_HOST:-}
+      - PACS3_PORT=${PACS3_PORT:-104}
+      - PACS3_AET=${PACS3_AET:-ORTHANC}
     volumes:
       - ./US_images:/app/US_images
       - ./outputs:/app/outputs
       - ./CUS.db:/app/CUS.db
-    environment:
-      - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-2}
-      - MAX_QUEUE_SIZE=${MAX_QUEUE_SIZE:-16}
-      - PACS_HOST=orthanc
-      - PACS_PORT=4242
-      - PACS_AET=ORTHANC
     restart: unless-stopped
     networks:
       - cus-net

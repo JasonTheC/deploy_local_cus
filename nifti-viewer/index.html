@@ -20,25 +20,24 @@
   .file-item:hover{background:#21262d}
   .file-item.active{background:#1f6feb33;color:#58a6ff;border-left:3px solid #58a6ff}
   .viewer-area{flex:1;display:flex;flex-direction:column;overflow:hidden}
-  .toolbar{background:#161b22;padding:6px 12px;border-bottom:1px solid #30363d;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-  .toolbar label{font-size:12px;color:#8b949e}
-  .toolbar select,.toolbar input[type=range]{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:3px 6px;border-radius:4px;font-size:12px}
-  .toolbar select{cursor:pointer}
-  .toolbar input[type=range]{width:160px;accent-color:#58a6ff}
-  .toolbar .info{margin-left:auto;font-size:12px;color:#8b949e;font-variant-numeric:tabular-nums}
-  .canvas-wrap{flex:1;display:flex;align-items:center;justify-content:center;background:#010409;position:relative;overflow:hidden}
-  canvas{max-width:100%;max-height:100%;image-rendering:pixelated}
-  .placeholder{display:flex;align-items:center;justify-content:center;height:100%;color:#484f58;font-size:14px;text-align:center;padding:20px}
+  .toolbar{background:#161b22;padding:6px 12px;border-bottom:1px solid #30363d;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .toolbar label{font-size:12px;color:#8b949e;display:flex;align-items:center;gap:6px}
+  .toolbar select{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:3px 6px;border-radius:4px;font-size:12px;cursor:pointer}
+  .toolbar .hint{margin-left:auto;font-size:11px;color:#8b949e}
+  .canvas-wrap{flex:1;position:relative;background:#010409;overflow:hidden}
+  .canvas-wrap canvas{position:absolute;inset:0;width:100%;height:100%}
+  .placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#484f58;font-size:14px;text-align:center;padding:20px;z-index:2;background:#010409}
   .status{position:absolute;top:10px;left:50%;transform:translateX(-50%);background:#161b22ee;padding:6px 14px;border-radius:6px;font-size:12px;color:#58a6ff;z-index:10;display:none}
+  .status.error{color:#f85149}
 </style>
-<!-- NIfTI reader library (pure JS, no WebGL) -->
-<script src="https://cdn.jsdelivr.net/npm/nifti-reader-js@0.1.7/nifti-reader.min.js"></script>
+<!-- Niivue WebGL NIfTI viewer — served locally, no CDN dependency -->
+<script src="niivue.umd.js"></script>
 </head>
 <body>
 
 <header>
   <h1>CUS NIfTI Viewer</h1>
-  <span>3D volume slice viewer · Canvas 2D (no GPU required)</span>
+  <span>WebGL volume viewer · Niivue</span>
   <button class="refresh-btn" id="refreshBtn">↻ Refresh</button>
 </header>
 
@@ -48,29 +47,31 @@
     <div class="file-list" id="file-list"><div style="padding:12px;color:#484f58;font-size:12px;">Loading…</div></div>
   </div>
   <div class="viewer-area">
-    <div class="toolbar" id="toolbar" style="display:none">
-      <label>Axis:
-        <select id="axisSelect">
-          <option value="axial">Axial (XY)</option>
-          <option value="coronal">Coronal (YZ)</option>
-          <option value="sagittal">Sagittal (XZ)</option>
+    <div class="toolbar" id="toolbar">
+      <label>View:
+        <select id="sliceTypeSelect">
+          <option value="multi" selected>Multiplanar + 3D</option>
+          <option value="axial">Axial</option>
+          <option value="coronal">Coronal</option>
+          <option value="sagittal">Sagittal</option>
+          <option value="render">3D Render</option>
         </select>
       </label>
-      <label>Slice:
-        <input type="range" id="sliceSlider" min="0" max="99" value="0">
+      <label>Colormap:
+        <select id="colormapSelect">
+          <option value="gray" selected>Gray</option>
+          <option value="viridis">Viridis</option>
+          <option value="inferno">Inferno</option>
+          <option value="hot">Hot</option>
+          <option value="bone">Bone</option>
+        </select>
       </label>
-      <label>Brightness:
-        <input type="range" id="brightSlider" min="-100" max="100" value="0">
-      </label>
-      <label>Contrast:
-        <input type="range" id="contrastSlider" min="0" max="300" value="100">
-      </label>
-      <span class="info" id="volInfo"></span>
+      <span class="hint">scroll = slice · left-drag = crosshair · right-drag = window/level</span>
     </div>
     <div class="canvas-wrap">
       <div class="placeholder" id="placeholder">Select a volume from the sidebar to view</div>
       <div class="status" id="status"></div>
-      <canvas id="viewerCanvas" style="display:none"></canvas>
+      <canvas id="gl"></canvas>
     </div>
   </div>
 </div>
@@ -79,51 +80,25 @@
 const fileListEl = document.getElementById('file-list');
 const placeholderEl = document.getElementById('placeholder');
 const statusEl = document.getElementById('status');
-const toolbarEl = document.getElementById('toolbar');
-const canvasEl = document.getElementById('viewerCanvas');
-const ctx = canvasEl.getContext('2d');
-const axisSelect = document.getElementById('axisSelect');
-const sliceSlider = document.getElementById('sliceSlider');
-const brightSlider = document.getElementById('brightSlider');
-const contrastSlider = document.getElementById('contrastSlider');
-const volInfoEl = document.getElementById('volInfo');
+const sliceTypeSelect = document.getElementById('sliceTypeSelect');
+const colormapSelect = document.getElementById('colormapSelect');
 
-let currentData = null;   // Uint8Array raw voxel data (Fortran order: x,y,z)
-let currentDims = null;   // [nx, ny, nz]
-let currentSlice = 0;
-let currentAxis = 'axial';
+const nv = new niivue.Niivue({
+  backColor: [0.004, 0.016, 0.035, 1],
+  show3Dcrosshair: true,
+  crosshairColor: [0.345, 0.651, 1, 1],
+  dragAndDropEnabled: false,
+});
+nv.attachToCanvas(document.getElementById('gl'));
 
-function getNiftiApi() {
-  if (typeof window.niftiReader === 'function') {
-    return { mode: 'legacy', api: window.niftiReader };
-  }
-  if (window.nifti && typeof window.nifti.readHeader === 'function') {
-    return { mode: 'modern', api: window.nifti };
-  }
-  return null;
-}
-
-function getTypedImageData(header, imageBuffer) {
-  switch (header.datatypeCode) {
-    case 2: return new Uint8Array(imageBuffer);
-    case 4: return new Int16Array(imageBuffer);
-    case 8: return new Int32Array(imageBuffer);
-    case 16: return new Float32Array(imageBuffer);
-    case 64: return new Float64Array(imageBuffer);
-    case 256: return new Int8Array(imageBuffer);
-    case 512: return new Uint16Array(imageBuffer);
-    case 768: return new Uint32Array(imageBuffer);
-    default: return new Uint8Array(imageBuffer);
-  }
-}
-
-function showStatus(msg, visible) {
-  if (!visible) { statusEl.style.display = 'none'; return; }
+function showStatus(msg, isError) {
+  if (!msg) { statusEl.style.display = 'none'; return; }
   statusEl.textContent = msg;
+  statusEl.className = 'status' + (isError ? ' error' : '');
   statusEl.style.display = 'block';
 }
 
-// ── File listing ────────────────────────────────────────────
+// ── File listing (nginx autoindex of /volumes/) ─────────────
 async function loadFiles() {
   fileListEl.innerHTML = '<div style="padding:12px;color:#484f58;font-size:12px;">Loading volumes…</div>';
   try {
@@ -131,19 +106,22 @@ async function loadFiles() {
     const html = await resp.text();
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
-    const anchors = doc.querySelectorAll('a[href]');
     const files = [];
-    anchors.forEach(a => {
+    doc.querySelectorAll('a[href]').forEach(a => {
       const href = a.getAttribute('href');
       if (href.endsWith('.nii') || href.endsWith('.nii.gz')) {
         let url = href.startsWith('/') ? href : '/volumes/' + href;
         url = url.split('?')[0];
-        files.push({ name: a.textContent.trim().replace(/^→\s*/, ''), url });
+        // Derive name from the href, not the anchor text — nginx autoindex
+        // truncates long names in the text, and Niivue detects the image
+        // format from the name's extension.
+        const name = decodeURIComponent(url.split('/').pop());
+        files.push({ name, url });
       }
     });
     renderFiles(files);
   } catch (err) {
-    fileListEl.innerHTML = `<div style="padding:12px;color:#f85149;font-size:12px;">Failed to load list. Place .nii files in outputs/ and refresh.</div>`;
+    fileListEl.innerHTML = '<div style="padding:12px;color:#f85149;font-size:12px;">Failed to load list. Place .nii files in outputs/ and refresh.</div>';
   }
 }
 
@@ -163,189 +141,45 @@ function renderFiles(files) {
   });
 }
 
-// ── Load & parse NIfTI ──────────────────────────────────────
+// ── Volume loading ──────────────────────────────────────────
 async function selectVolume(file, el) {
   document.querySelectorAll('.file-item').forEach(e => e.classList.remove('active'));
   el.classList.add('active');
-  placeholderEl.style.display = 'none';
-  showStatus(`Downloading ${file.name}…`, true);
-
+  showStatus(`Loading ${file.name}…`, false);
   try {
-    const resp = await fetch(file.url);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const buf = await resp.arrayBuffer();
-
-    // Decompress if gzip
-    let parsedBuf = buf;
-    if (file.url.endsWith('.gz')) {
-      const ds = new DecompressionStream('gzip');
-      const blob = new Response(new Blob([buf]).stream().pipeThrough(ds)).arrayBuffer();
-      parsedBuf = await blob;
-    }
-
-    // Parse with nifti-reader-js (supports both legacy and modern global APIs)
-    const niftiBinding = getNiftiApi();
-    if (!niftiBinding) {
-      throw new Error('nifti-reader-js did not load (check CDN/network access)');
-    }
-
-    let imgData;
-    let dims;
-    if (niftiBinding.mode === 'legacy') {
-      const parsed = niftiBinding.api(parsedBuf);
-      imgData = parsed.imgData;
-      dims = [parsed.hdr.dims[1], parsed.hdr.dims[2], parsed.hdr.dims[3]];
-    } else {
-      const nifti = niftiBinding.api;
-      if (!nifti.isNIFTI(parsedBuf)) {
-        throw new Error('File is not a valid NIfTI volume');
-      }
-      const header = nifti.readHeader(parsedBuf);
-      const image = nifti.readImage(header, parsedBuf);
-      imgData = getTypedImageData(header, image);
-      dims = [header.dims[1], header.dims[2], header.dims[3]];
-    }
-
-    // Convert to Uint8 raw data — handle different dtypes
-    let rawData;
-    if (imgData instanceof Uint8Array) {
-      rawData = imgData;
-    } else if (imgData instanceof Int16Array || imgData instanceof Uint16Array) {
-      // Normalize 16-bit to 8-bit for display
-      rawData = normalizeToUint8(imgData);
-    } else if (imgData instanceof Float32Array || imgData instanceof Float64Array) {
-      rawData = normalizeFloatToUint8(imgData);
-    } else {
-      rawData = new Uint8Array(imgData);
-    }
-
-    currentData = rawData;
-    currentDims = dims;
-    currentSlice = Math.floor(dims[2] / 2); // start at middle slice
-    currentAxis = 'axial';
-
-    axisSelect.value = 'axial';
-    updateSlider();
-    toolbarEl.style.display = 'flex';
-    canvasEl.style.display = 'block';
-    volInfoEl.textContent = `${dims[0]}×${dims[1]}×${dims[2]} · ${(rawData.length/1024).toFixed(1)} KB`;
-    renderSlice();
-    showStatus(null, false);
+    await nv.loadVolumes([{ url: file.url, name: file.name, colormap: colormapSelect.value }]);
+    placeholderEl.style.display = 'none';
+    applySliceType();
+    showStatus(null);
   } catch (err) {
     console.error('Load error:', err);
     showStatus(`Error: ${err.message}`, true);
   }
 }
 
-function normalizeToUint8(arr) {
-  let min = Infinity, max = -Infinity;
-  for (let i = 0; i < arr.length; i++) { if (arr[i] < min) min = arr[i]; if (arr[i] > max) max = arr[i]; }
-  const range = max - min || 1;
-  const out = new Uint8Array(arr.length);
-  for (let i = 0; i < arr.length; i++) out[i] = Math.round(((arr[i] - min) / range) * 255);
-  return out;
-}
-
-function normalizeFloatToUint8(arr) {
-  // Use 2nd and 98th percentiles for robust normalization
-  const copy = new Float64Array(arr);
-  const sorted = copy.filter(v => isFinite(v) && v !== 0).sort((a,b) => a-b);
-  if (!sorted.length) return normalizeToUint8(new Int16Array(arr.buffer));
-  const p2 = sorted[Math.floor(sorted.length * 0.02)] || 0;
-  const p98 = sorted[Math.floor(sorted.length * 0.98)] || 1;
-  const range = p98 - p2 || 1;
-  const out = new Uint8Array(arr.length);
-  for (let i = 0; i < arr.length; i++) {
-    let v = ((arr[i] - p2) / range) * 255;
-    out[i] = Math.max(0, Math.min(255, Math.round(v)));
+function applySliceType() {
+  const v = sliceTypeSelect.value;
+  if (v === 'multi') {
+    nv.opts.multiplanarShowRender = niivue.SHOW_RENDER.ALWAYS;
+    nv.setSliceType(nv.sliceTypeMultiplanar);
+  } else if (v === 'axial') {
+    nv.setSliceType(nv.sliceTypeAxial);
+  } else if (v === 'coronal') {
+    nv.setSliceType(nv.sliceTypeCoronal);
+  } else if (v === 'sagittal') {
+    nv.setSliceType(nv.sliceTypeSagittal);
+  } else {
+    nv.setSliceType(nv.sliceTypeRender);
   }
-  return out;
 }
 
-// ── Slice rendering (Fortran order: x fastest, then y, then z) ──
-function renderSlice() {
-  const [nx, ny, nz] = currentDims;
-  const bright = parseInt(brightSlider.value);
-  const contrast = parseInt(contrastSlider.value) / 100;
-
-  let canvasW, canvasH, pixelData;
-
-  if (currentAxis === 'axial') {
-    // XY plane at slice Z — canvas: width=nx, height=ny
-    canvasW = nx; canvasH = ny;
-    pixelData = new Uint8ClampedArray(nx * ny * 4);
-    for (let y = 0; y < ny; y++) {
-      for (let x = 0; x < nx; x++) {
-        const idx = x + y * nx + currentSlice * nx * ny;
-        const v = applyWindow(currentData[idx], bright, contrast);
-        const pi = (y * nx + x) * 4;
-        pixelData[pi] = v; pixelData[pi+1] = v; pixelData[pi+2] = v; pixelData[pi+3] = 255;
-      }
-    }
-  } else if (currentAxis === 'coronal') {
-    // YZ plane — canvas: width=ny, height=nz
-    canvasW = ny; canvasH = nz;
-    pixelData = new Uint8ClampedArray(ny * nz * 4);
-    for (let z = 0; z < nz; z++) {
-      for (let y = 0; y < ny; y++) {
-        const idx = currentSlice + y * nx + z * nx * ny;
-        const v = applyWindow(currentData[idx], bright, contrast);
-        const pi = (z * ny + y) * 4;
-        pixelData[pi] = v; pixelData[pi+1] = v; pixelData[pi+2] = v; pixelData[pi+3] = 255;
-      }
-    }
-  } else { // sagittal
-    // XZ plane — canvas: width=nx, height=nz
-    canvasW = nx; canvasH = nz;
-    pixelData = new Uint8ClampedArray(nx * nz * 4);
-    for (let z = 0; z < nz; z++) {
-      for (let x = 0; x < nx; x++) {
-        const idx = x + currentSlice * nx + z * nx * ny;
-        const v = applyWindow(currentData[idx], bright, contrast);
-        const pi = (z * nx + x) * 4;
-        pixelData[pi] = v; pixelData[pi+1] = v; pixelData[pi+2] = v; pixelData[pi+3] = 255;
-      }
-    }
-  }
-
-  canvasEl.width = canvasW;
-  canvasEl.height = canvasH;
-  const img = ctx.createImageData(canvasW, canvasH);
-  img.data.set(pixelData);
-  ctx.putImageData(img, 0, 0);
-}
-
-function applyWindow(val, bright, contrast) {
-  let v = val * contrast + bright * 2.55;
-  return Math.max(0, Math.min(255, Math.round(v)));
-}
-
-function updateSlider() {
-  const [nx, ny, nz] = currentDims;
-  if (currentAxis === 'axial') sliceSlider.max = nz - 1;
-  else if (currentAxis === 'coronal') sliceSlider.max = nx - 1;
-  else sliceSlider.max = ny - 1;
-  if (parseInt(sliceSlider.value) > sliceSlider.max) sliceSlider.value = Math.floor(sliceSlider.max / 2);
-  volInfoEl.textContent = `${nx}×${ny}×${nz} · ${currentAxis} slice ${sliceSlider.value}/${sliceSlider.max}`;
-}
-
-// ── Event handlers ──────────────────────────────────────────
-sliceSlider.addEventListener('input', () => { currentSlice = parseInt(sliceSlider.value); renderSlice(); updateSlider(); });
-axisSelect.addEventListener('change', () => { currentAxis = axisSelect.value; currentSlice = Math.floor(parseInt(sliceSlider.max) / 2) || 0; updateSlider(); sliceSlider.value = currentSlice; renderSlice(); });
-brightSlider.addEventListener('input', renderSlice);
-contrastSlider.addEventListener('input', renderSlice);
-document.getElementById('refreshBtn').addEventListener('click', loadFiles);
-
-// Keyboard navigation
-document.addEventListener('keydown', e => {
-  if (!currentData) return;
-  const max = parseInt(sliceSlider.max);
-  if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-    e.preventDefault(); currentSlice = Math.max(0, currentSlice - 1); sliceSlider.value = currentSlice; renderSlice(); updateSlider();
-  } else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-    e.preventDefault(); currentSlice = Math.min(max, currentSlice + 1); sliceSlider.value = currentSlice; renderSlice(); updateSlider();
+sliceTypeSelect.addEventListener('change', applySliceType);
+colormapSelect.addEventListener('change', () => {
+  if (nv.volumes.length) {
+    nv.setColormap(nv.volumes[0].id, colormapSelect.value);
   }
 });
+document.getElementById('refreshBtn').addEventListener('click', loadFiles);
 
 loadFiles();
 </script>

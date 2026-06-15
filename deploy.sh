@@ -234,6 +234,12 @@ verify_services() {
     echo "  ✗ TCP Image Server   — port 8890 not accepting connections (check: ./deploy.sh logs backend)"
     failed=1
   fi
+  if timeout 2 bash -c 'echo > /dev/tcp/localhost/7556' 2>/dev/null; then
+    echo "  ✓ WebSocket Server   (ws://localhost:7556)"
+  else
+    echo "  ✗ WebSocket Server   — port 7556 not accepting connections (check: ./deploy.sh logs backend)"
+    failed=1
+  fi
   if [ "$failed" -ne 0 ]; then
     echo ""
     echo "⚠️  Some services failed verification. Recent logs:"
@@ -254,6 +260,7 @@ show_status() {
   echo "  Endpoints"
   echo "═══════════════════════════════════════════════════"
   echo "  📡 TCP Image Server   : tcp://localhost:8890"
+  echo "  🔌 WebSocket Server  : ws://localhost:7556"
   echo "  🏥 OHIF DICOM Viewer  : http://localhost:3000"
   echo "  🧊 NIfTI 3D Viewer    : http://localhost:3001"
   echo "  🗄️  Orthanc REST API   : http://localhost:8042"

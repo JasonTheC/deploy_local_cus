@@ -13,7 +13,8 @@ RUN pip install --no-cache-dir "numpy>=1.21.0,<2"
 RUN pip install --no-cache-dir \
     pydicom pynetdicom nibabel Pillow natsort pycryptodome \
     segmentation-models-pytorch \
-    cupy-cuda12x
+    cupy-cuda12x \
+    "websockets>=12.0"
 
 COPY mobilenet_models/ ./mobilenet_models/
 COPY pos_cupy_finalv2.py .
@@ -22,9 +23,10 @@ COPY pacs-transfer-server.py .
 
 RUN mkdir -p /app/US_images /app/outputs
 
-EXPOSE 8890
+EXPOSE 8890 7556
 
 ENV MAX_CONCURRENT_JOBS=2
 ENV MAX_QUEUE_SIZE=16
+ENV PACS_WS_PORT=7556
 
 CMD ["python", "pacs-transfer-server.py"]

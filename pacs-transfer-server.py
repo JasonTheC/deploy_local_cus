@@ -28,6 +28,7 @@ from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_OAEP, AES
 from Crypto.Random import get_random_bytes
 from Crypto.Util.Padding import unpad
+import websockets
 
 # Import the CuPy-accelerated 3D reconstruction module
 import sys
@@ -37,13 +38,14 @@ from pos_cupy_finalv2 import process_study as process_study_cupy
 CUPY_AVAILABLE = True
 print("✓ CuPy-accelerated 3D reconstruction available")
 
-# Global dict to accumulate images in memory
-study_images = {}
+# Studies currently queued or being processed (avoid duplicate enqueues)
+STUDIES_IN_FLIGHT = set()
 
 
 # Server configuration
 HOST = "0.0.0.0"
-PORT = 8890  # Different port from guidanceWS3.py
+PORT = int(os.environ.get('PACS_TCP_PORT', '8890'))
+WEBSOCKET_PORT = int(os.environ.get('PACS_WS_PORT', '7556'))
 
 # Generate RSA key pair for encryption
 key = RSA.generate(2048)
@@ -253,11 +255,127 @@ def place_slice_in_volume(points, image_array, theta_y, center_x, center_y, z_po
 
 
 
+def get_pacs_nodes(study_info=None):
+    """Return the list of PACS destinations to replicate every study to.
+
+    Each node is a dict: {name, ip, port, ae_title}.
+
+    Configuration (all via environment variables, easy to extend):
+      Primary node:   PACS_HOST  / PACS_PORT  / PACS_AET
+      Fallback nodes:  PACS2_HOST / PACS2_PORT / PACS2_AET
+                       PACS3_HOST / PACS3_PORT / PACS3_AET   ... up to PACS9_*
+
+    A node is only added if its *_HOST is set, so adding a second or third
+    site is just three extra lines in docker-compose.yml. Ports/AETs default
+    to the standard DICOM 104 / "ORTHANC" if omitted.
+
+    Per-study overrides (optional, from the app's metadata):
+      study_info['pacs_nodes']  -> explicit list, replaces env config
+      study_info['pacs']        -> single dict, merged into the primary node
+    """
+    def _node(name, ip, port, ae_title):
+        return {
+            'name': name,
+            'ip': ip,
+            'port': int(port),
+            'ae_title': ae_title,
+        }
+
+    # Primary (backward compatible with the previous single-node setup)
+    primary = _node(
+        os.environ.get('PACS_AET', 'ORTHANC'),
+        os.environ.get('PACS_HOST', '127.0.0.1'),
+        os.environ.get('PACS_PORT', '4242'),
+        os.environ.get('PACS_AET', 'ORTHANC'),
+    )
+    if study_info and isinstance(study_info.get('pacs'), dict):
+        ov = study_info['pacs']
+        primary['ip'] = ov.get('ip', primary['ip'])
+        primary['port'] = int(ov.get('port', primary['port']))
+        primary['ae_title'] = ov.get('ae_title', primary['ae_title'])
+        primary['name'] = ov.get('ae_title', primary['name'])
+
+    nodes = [primary]
+
+    # Numbered fallback nodes: PACS2_*, PACS3_*, ... PACS9_*
+    for i in range(2, 10):
+        host = os.environ.get(f'PACS{i}_HOST')
+        if not host:
+            continue
+        nodes.append(_node(
+            os.environ.get(f'PACS{i}_AET', f'PACS{i}'),
+            host,
+            os.environ.get(f'PACS{i}_PORT', '104'),
+            os.environ.get(f'PACS{i}_AET', 'ORTHANC'),
+        ))
+
+    # Explicit per-study list overrides the env-based config entirely
+    if study_info and isinstance(study_info.get('pacs_nodes'), list):
+        nodes = []
+        for n in study_info['pacs_nodes']:
+            if not n.get('ip'):
+                continue
+            nodes.append(_node(
+                n.get('ae_title', n['ip']),
+                n['ip'],
+                n.get('port', '104'),
+                n.get('ae_title', 'ORTHANC'),
+            ))
+
+    return nodes
+
+
+def store_to_node(node, generated_dcms):
+    """C-STORE every generated DICOM to a single PACS node.
+
+    Returns True only if the association was established AND every instance
+    was accepted; any connection failure or rejected instance returns False
+    so the caller can withhold the pacs_sent.flag and retry later.
+    """
+    label = f"{node['name']} ({node['ip']}:{node['port']}, AET {node['ae_title']})"
+    print(f"→ Sending {len(generated_dcms)} DICOM(s) to PACS {label}")
+
+    ae = AE(ae_title='PYNETDICOM')
+    ae.add_requested_context('1.2.840.10008.5.1.4.1.1.6.1')
+    try:
+        assoc = ae.associate(node['ip'], node['port'], ae_title=node['ae_title'])
+    except Exception as e:
+        print(f"✗ Could not connect to {label}: {e}")
+        return False
+
+    if not assoc.is_established:
+        print(f"✗ Association rejected/aborted/never connected for {label}")
+        return False
+
+    # 0x0000 = success; 0xB000/B006/B007 = stored with warnings (coercion etc.)
+    OK_STATUSES = (0x0000, 0xB000, 0xB006, 0xB007)
+    sent_ok = 0
+    failures = []
+    try:
+        for dcm_file in generated_dcms:
+            ds_dataset = dcmread(dcm_file)
+            status = assoc.send_c_store(ds_dataset)
+            code = getattr(status, 'Status', None) if status else None
+            if code in OK_STATUSES:
+                sent_ok += 1
+            else:
+                failures.append((dcm_file, code))
+                print(f"✗ C-STORE FAILED for {dcm_file} → {node['name']} - status: "
+                      f"{f'0x{code:04X}' if code is not None else 'no response'}")
+    finally:
+        assoc.release()
+
+    print(f"   {node['name']}: {sent_ok}/{len(generated_dcms)} stored OK")
+    return not failures
+
+
 def send_to_pacs(study_dir, study_info):
     """
-    Send study to PACS server.
-    This is a placeholder - implement actual PACS C-STORE here.
-    
+    Generate DICOMs for a study and replicate them to every configured PACS
+    node (see get_pacs_nodes). The study is only marked sent (pacs_sent.flag)
+    once *all* nodes have stored every instance, so a fallback node that was
+    offline gets retried by the janitor on the next pass.
+
     Args:
         study_dir: Path to study directory containing images and metadata
     """
@@ -266,29 +384,31 @@ def send_to_pacs(study_dir, study_info):
 
     print(f"Study info: {json.dumps(study_info, indent=2)}")
 
-    # Build PACS config defaults (can be overridden by study_info['pacs'])
-    # Inside Docker the Orthanc service is reachable as "orthanc"; override
-    # via PACS_HOST / PACS_PORT / PACS_AET environment variables.
-    pacs_cfg = {
-        'ae_title': os.environ.get('PACS_AET', 'ORTHANC'),
-        'port': int(os.environ.get('PACS_PORT', '4242')),
-        'ip': os.environ.get('PACS_HOST', '127.0.0.1')
-    }
-    if isinstance(study_info.get('pacs'), dict):
-        pacs_cfg.update(study_info.get('pacs'))
+    # Collect image files grouped into one series per raw/processed leaf folder.
+    # Layouts handled:
+    #   {study_dir}/{organ}/{orientation}/raw|processed/*.jpg  (current app)
+    #   {study_dir}/{orientation}/raw|processed/*.jpg          (older app)
+    # The series key is the folder path relative to the study dir, e.g.
+    # "rightkidney/transverse/raw", so right and left kidney never merge.
+    series_images = {}  # Key: series name, Value: list of image paths
 
-    # Collect image files grouped by series (raw_* directories)
-    series_images = {}  # Key: directory name, Value: list of image paths
     for root, dirs, files in os.walk(study_dir):
-        # Only process files in raw_* directories
-        if 'raw_' not in os.path.basename(root):
+        if os.path.basename(root) not in ('raw', 'processed'):
             continue
-        series_name = os.path.basename(root)
+        series_key = os.path.relpath(root, study_dir).replace(os.sep, '/')
         for file in files:
             if file.lower().endswith(('.jpeg', '.jpg', '.png')):
-                if series_name not in series_images:
-                    series_images[series_name] = []
-                series_images[series_name].append(os.path.join(root, file))
+                series_images.setdefault(series_key, []).append(os.path.join(root, file))
+
+    # Fallback: legacy raw_* layout
+    if not series_images:
+        for root, dirs, files in os.walk(study_dir):
+            if 'raw_' not in os.path.basename(root):
+                continue
+            series_name = os.path.basename(root)
+            for file in files:
+                if file.lower().endswith(('.jpeg', '.jpg', '.png')):
+                    series_images.setdefault(series_name, []).append(os.path.join(root, file))
 
     if not series_images:
         print("No images found to convert/send")
@@ -360,8 +480,12 @@ def send_to_pacs(study_dir, study_info):
     study_instance_uid = study_info.get('studyinstanceuid') \
         or (generate_uid(entropy_srcs=[str(study_uuid)]) if study_uuid else generate_uid())
 
-    # Study description from the scanned organ (e.g. "Prostate")
-    study_description = str(study_info.get('organ', '')).title()
+    # Study description lists every organ scanned in this study (the single
+    # 'organ' field is last-writer-wins when multiple organs share a study)
+    organs = study_info.get('organs') or []
+    if not organs and study_info.get('organ'):
+        organs = [study_info['organ']]
+    study_description = ', '.join(str(o).title() for o in organs)[:64]
     
     # Get depth from study info (in cm)
     depth_cm = study_info.get('depth', 15)
@@ -369,9 +493,10 @@ def send_to_pacs(study_dir, study_info):
     # Process each series separately
     generated_dcms = []
     for series_name, img_paths in series_images.items():
-        # Generate one SeriesInstanceUID per series (folder)
-        series_instance_uid = generate_uid()
-        series_description = series_name.replace('raw_', '').replace('_', ' ').title()
+        # Deterministic SeriesInstanceUID per (study, folder) so re-sending the
+        # same study merges in PACS instead of duplicating every series
+        series_instance_uid = generate_uid(entropy_srcs=[str(study_uuid), series_name])
+        series_description = series_name.replace('raw_', '').replace('_', ' ').replace('/', ' ').title()
         
         print(f"Processing series: {series_description} ({len(img_paths)} images)")
         
@@ -405,20 +530,25 @@ def send_to_pacs(study_dir, study_info):
             ds.SeriesDescription = series_description
             ds.SeriesNumber = list(series_images.keys()).index(series_name) + 1
             ds.InstanceNumber = instance_number
-            ds.SOPInstanceUID = generate_uid()
+            # Deterministic per image file: a re-send produces the same SOP
+            # Instance UID, which PACS treats as the same object (idempotent)
+            ds.SOPInstanceUID = generate_uid(
+                entropy_srcs=[str(study_uuid), series_name, os.path.basename(img_path)])
             ds.Modality = 'US'
 
-            # convert to grayscale and 16-bit similar to guidance.dicom_util
+            # Convert to 8-bit grayscale: the US Image Storage SOP class
+            # requires 8-bit pixels — 16-bit stores fine in Orthanc but web
+            # viewers (Stone/OHIF) render it black
             image_2d = np.array(img)
             if len(image_2d.shape) == 3:
                 image_2d = np.mean(image_2d, axis=2).astype(float)
             # Guard against zero-division
             if image_2d.max() == 0:
                 image_2d = image_2d + 1.0
-            image_2d = ((image_2d / image_2d.max()) * 65535).astype(np.uint16)
+            image_2d = ((image_2d / image_2d.max()) * 255).astype(np.uint8)
 
             # Calculate live pixel region (excluding black borders)
-            non_zero_rows = np.any(image_2d > image_2d.min() + 100, axis=1)
+            non_zero_rows = np.any(image_2d > image_2d.min() + 1, axis=1)
             row_indices = np.where(non_zero_rows)[0]
             if len(row_indices) > 0:
                 live_pixel_height = row_indices[-1] - row_indices[0] + 1
@@ -430,9 +560,11 @@ def send_to_pacs(study_dir, study_info):
             ds.SamplesPerPixel = 1
             ds.PhotometricInterpretation = 'MONOCHROME2'
             ds.PixelRepresentation = 0
-            ds.HighBit = 15
-            ds.BitsStored = 16
-            ds.BitsAllocated = 16
+            ds.HighBit = 7
+            ds.BitsStored = 8
+            ds.BitsAllocated = 8
+            ds.WindowCenter = 128
+            ds.WindowWidth = 256
             ds.Columns = image_2d.shape[1]
             ds.Rows = image_2d.shape[0]
             ds.PixelData = image_2d.tobytes()
@@ -469,30 +601,32 @@ def send_to_pacs(study_dir, study_info):
         print("No DICOM files generated — nothing to send")
         return False
 
-    # Send all DICOMs in a single association
-    print(f"Attempting to send {len(generated_dcms)} DICOM files to PACS {pacs_cfg['ip']}:{pacs_cfg['port']}")
-    ae = AE(ae_title='PYNETDICOM')
-    ae.add_requested_context('1.2.840.10008.5.1.4.1.1.6.1')
-    assoc = ae.associate(pacs_cfg['ip'], pacs_cfg['port'], ae_title=pacs_cfg['ae_title'])
+    # Replicate the same DICOM set to every configured PACS node. Stores are
+    # idempotent (deterministic SOP Instance UIDs), so re-sending to a node
+    # that already has the study just merges — which is what lets the janitor
+    # safely retry a node that was offline on an earlier pass.
+    nodes = get_pacs_nodes(study_info)
+    print(f"Replicating study to {len(nodes)} PACS node(s): "
+          f"{', '.join(n['name'] for n in nodes)}")
 
-    if not assoc.is_established:
-        print('Association rejected, aborted or never connected')
+    all_nodes_ok = True
+    for node in nodes:
+        if not store_to_node(node, generated_dcms):
+            all_nodes_ok = False
+
+    # Only mark the study done once EVERY node confirmed storage. A partial
+    # success leaves the flag unwritten, so the janitor re-enqueues the study
+    # later and the missing node(s) get another attempt.
+    if not all_nodes_ok:
+        print("✗ One or more PACS nodes failed — NOT writing pacs_sent.flag "
+              "(janitor will retry the unfinished node(s))")
         return False
 
-    try:
-        for dcm_file in generated_dcms:
-            ds_dataset = dcmread(dcm_file)
-            status = assoc.send_c_store(ds_dataset)
-            print(f"Sent {dcm_file} - Status: {status}")
-    finally:
-        assoc.release()
-
-    # Mark finished with flag
     pacs_flag = f"{study_dir}/pacs_sent.flag"
     with open(pacs_flag, 'w') as f:
         f.write(datetime.datetime.now().isoformat())
 
-    print(f"✅ Sent study to PACS and wrote flag {pacs_flag}")
+    print(f"✅ Stored study on all {len(nodes)} PACS node(s); wrote flag {pacs_flag}")
     return True
 
 
@@ -521,55 +655,110 @@ async def process_study_async(study_dir):
     # Extract patient and study IDs
     patient_id = study_info.get('patientid', 'unknown')
     study_id = study_info.get('studyid', study_info.get('studyuuid', 'unknown'))
-    
-    # Scan the study directory to find what raw_ directories actually exist
-    study_path = f"US_images/{patient_id}/{study_id}"
-    raw_dirs = []
-    if os.path.isdir(study_path):
-        for item in os.listdir(study_path):
-            if item.startswith('raw_') and os.path.isdir(os.path.join(study_path, item)):
-                raw_dirs.append(item)
-    
-    # Extract unique target+side combinations from directory names
-    # e.g., raw_left_kidney_sagital -> (left_, kidney)
-    studies_to_process = set()
-    for dirname in raw_dirs:
-        # Remove raw_ prefix and orientation suffix
-        parts = dirname.replace('raw_', '').split('_')
-        # Filter out orientation keywords
-        parts = [p for p in parts if p not in ['sagital', 'transverse']]
-        
-        # Reconstruct target and side
-        if not parts:
-            continue
-        
-        side = ''
-        target = ''
-        if parts[0] in ['left', 'right']:
-            side = parts[0] + '_'
-            target = '_'.join(parts[1:]) if len(parts) > 1 else ''
+
+    def organ_to_side_target(organ_name):
+        organ_name = str(organ_name).lower()
+        if 'kidney' in organ_name:
+            target = 'kidney'
+        elif 'prostate' in organ_name:
+            # before the bladder check: "prostatebladder" contains "bladder"
+            target = 'prostatebladder'
+        elif 'bladder' in organ_name or 'postvoid' in organ_name:
+            target = 'bladder'
         else:
-            target = '_'.join(parts)
-        
-        if target:
-            studies_to_process.add((side, target))
-    
-    print(f"Found {len(studies_to_process)} target(s) to process: {studies_to_process}")
-    
-    # Process each target separately (e.g., left kidney, right kidney)
-    for side, target in studies_to_process:
+            target = 'prostatebladder'
+        side = ''
+        if 'left' in organ_name:
+            side = 'left_'
+        elif 'right' in organ_name:
+            side = 'right_'
+        return side, target
+
+    # Sweep axis folder names the app can produce. The non-transverse axis is
+    # "longitudinal" for kidneys and "sagital"/"sagittal" for pelvic organs.
+    AXIS_NAMES = ('transverse', 'sagital', 'sagittal', 'longitudinal')
+
+    def axes_with_raw(parent_dir):
+        """Maps axis name -> path (relative to study_dir) of its raw folder."""
+        found = {}
+        for item in sorted(os.listdir(parent_dir)):
+            if item.lower() not in AXIS_NAMES:
+                continue
+            raw_sub = os.path.join(parent_dir, item, 'raw')
+            if os.path.isdir(raw_sub):
+                found[item.lower()] = os.path.relpath(raw_sub, study_dir)
+        return found
+
+    # Build one reconstruction job per organ scanned.
+    # Layout A (current app): {study}/{organ}/{axis}/raw/
+    # Layout B (older app):   {study}/{axis}/raw/  — organ from study_info
+    # Layout C (legacy):      {study}/raw_{side}{target}_{orientation}/
+    jobs = []  # dicts: {side, target, transverse_dir, sagital_dir, second_axis}
+
+    def make_job(side, target, axes):
+        second_axis = next(
+            (a for a in ('sagital', 'sagittal', 'longitudinal') if a in axes), None)
+        return {
+            'side': side,
+            'target': target,
+            'transverse_dir': axes.get('transverse'),
+            'sagital_dir': axes.get(second_axis) if second_axis else None,
+            'second_axis': second_axis or 'sagital',
+        }
+
+    top_dirs = [e for e in sorted(os.listdir(study_dir))
+                if os.path.isdir(os.path.join(study_dir, e))]
+
+    for entry in top_dirs:
+        if entry.lower() in AXIS_NAMES:
+            continue
+        axes = axes_with_raw(os.path.join(study_dir, entry))
+        if axes:
+            side, target = organ_to_side_target(entry)
+            jobs.append(make_job(side, target, axes))
+
+    if not jobs:
+        axes = axes_with_raw(study_dir)
+        if axes:
+            side, target = organ_to_side_target(study_info.get('organ', 'prostate'))
+            jobs.append(make_job(side, target, axes))
+
+    if not jobs:
+        # Legacy raw_* folders: derive (side, target) pairs from the dir names
+        legacy_pairs = {}
+        for entry in top_dirs:
+            if not entry.startswith('raw_') or entry.endswith('_dicom'):
+                continue
+            side, target = organ_to_side_target(entry)
+            axes = legacy_pairs.setdefault((side, target), {})
+            lower = entry.lower()
+            if 'transverse' in lower:
+                axes['transverse'] = entry
+            elif 'sagit' in lower or 'longitudinal' in lower:
+                axes['sagital'] = entry
+        for (side, target), axes in legacy_pairs.items():
+            jobs.append(make_job(side, target, axes))
+
+    print(f"Reconstruction jobs: {jobs}")
+
+    # Process each organ separately (e.g., left kidney, right kidney)
+    for job in jobs:
+        side, target = job['side'], job['target']
         print(f"\n{'='*60}")
         print(f"Processing: patient={patient_id}, study={study_id}, target={target}, side={side}")
         print(f"{'='*60}")
-        
+
         r_common = {
             'patientid': patient_id,
             'studyid': study_id,
             'target': target,
             'side': side,
-            'studies': {}
+            'studies': {},
+            'sagital_dir': job['sagital_dir'],
+            'transverse_dir': job['transverse_dir'],
+            'second_axis': job['second_axis'],
         }
-        
+
         print("Passing to CuPy-accelerated 3D reconstruction...")
         loop = asyncio.get_event_loop()
         try:
@@ -579,9 +768,15 @@ async def process_study_async(study_dir):
             print(f"✗ 3D reconstruction failed for {side}{target}: {e}")
             import traceback
             traceback.print_exc()
-    
-    if study_dir in study_images:
-        del study_images[study_dir]
+            # Also persist the traceback into the study folder (mounted on the
+            # host) so failures are debuggable without docker access
+            try:
+                with open(os.path.join(study_dir, 'processing_error.log'), 'a') as ef:
+                    ef.write(f"\n[{datetime.datetime.now().isoformat()}] "
+                             f"reconstruction failed for {side}{target}:\n")
+                    ef.write(traceback.format_exc())
+            except Exception:
+                pass
     
     print(f"\n✓ All processing completed for {patient_id}/{study_id}")
     return True
@@ -659,18 +854,9 @@ async def processImage(image_data, r_d, writer, images_processed, image_list, fi
     
     # Save image
     cv2.imwrite(fname, decoded)
-    
-    # Accumulate images in memory for direct processing
-    study_dir = f"{idir}/{r_d['patientid']}/{r_d['studyid']}"
-    if study_dir not in study_images:
-        study_images[study_dir] = {'sag': {'images': [], 'files': []}, 'trans': {'images': [], 'files': []}}
-    
-    orientation = 'trans' if 'transverse' in sub_dir else 'sag'
-    study_images[study_dir][orientation]['images'].append(decoded)
-    study_images[study_dir][orientation]['files'].append(fname)
-    
-    # Collect images for batch processing
-    image_list.append((decoded, fname))
+
+    # Track filenames only — frames are re-read from disk when processing
+    image_list.append(fname)
     
     # Send acknowledgment
     writer.write(f"Image {images_processed} received".encode())
@@ -722,10 +908,14 @@ async def process_batch(r_d, image_list, writer):
 
         enqueue_result = None
         try:
-            if STUDY_QUEUE.full():
+            if study_dir in STUDIES_IN_FLIGHT:
+                enqueue_result = "Study already queued for processing"
+                print(enqueue_result)
+            elif STUDY_QUEUE.full():
                 enqueue_result = "Server busy: processing backlog full, try later"
                 print(enqueue_result)
             else:
+                STUDIES_IN_FLIGHT.add(study_dir)
                 await STUDY_QUEUE.put(study_dir)
                 enqueue_result = "Study enqueued for processing"
                 print(f"✓ {enqueue_result}")
@@ -734,21 +924,176 @@ async def process_batch(r_d, image_list, writer):
             print(f"✗ {enqueue_result}")
         
         # Now try to notify client (but don't fail if connection is lost)
-        try:
-            writer.write(f"Processed {len(image_list)} images\n".encode())
-            writer.write("Creating 3D volume and sending to PACS...\n".encode())
-            if enqueue_result:
-                writer.write(f"{enqueue_result}\n".encode())
-            await writer.drain()
-        except Exception as e:
-            print(f"Could not send response to client (connection lost): {e}")
+        if writer is not None:
+            try:
+                writer.write(f"Processed {len(image_list)} images\n".encode())
+                writer.write("Creating 3D volume and sending to PACS...\n".encode())
+                if enqueue_result:
+                    writer.write(f"{enqueue_result}\n".encode())
+                await writer.drain()
+            except Exception as e:
+                print(f"Could not send response to client (connection lost): {e}")
     else:
         # Not finished yet, just acknowledge
-        try:
-            writer.write(f"Processed {len(image_list)} images (not finished yet)".encode())
-            await writer.drain()
-        except Exception as e:
-            print(f"Could not send response to client: {e}")
+        if writer is not None:
+            try:
+                writer.write(f"Processed {len(image_list)} images (not finished yet)".encode())
+                await writer.drain()
+            except Exception as e:
+                print(f"Could not send response to client: {e}")
+
+
+async def handle_websocket_client(websocket):
+    """Handle Android app WebSocket connections.
+
+    Protocol (matches SocketThread.java):
+      1. Client sends metadata JSON (text)
+      2. For each image: filename text → binary data → server acks with
+         {"status":"image_received"} → client sends next
+      3. Client sends {"type":"complete"} then closes
+    """
+    remote = websocket.remote_address
+    print(f"[WS] New connection from {remote}")
+
+    r_d = None
+    images_processed = 0
+    image_list = []
+    current_filename = None
+
+    try:
+        async for raw_message in websocket:
+            # --- Text messages: metadata JSON, filenames, or completion ---
+            if isinstance(raw_message, str):
+                msg = raw_message.strip()
+
+                # First text message is the metadata JSON
+                if r_d is None:
+                    try:
+                        r_d = json.loads(msg)
+                        r_d = sanitise_json(r_d)
+                        if 'studyuuid' in r_d and 'studyid' not in r_d:
+                            r_d['studyid'] = r_d['studyuuid']
+                        if 'patientid' not in r_d:
+                            r_d['patientid'] = r_d.get('patientemail', 'unknown')
+                        study_dir = f"{idir}/{r_d.get('patientid','unknown')}/{r_d.get('studyid','unknown')}"
+                        os.makedirs(study_dir, exist_ok=True)
+                        json_path = f"{study_dir}/study_info.json"
+                        if os.path.exists(json_path):
+                            try:
+                                with open(json_path, 'r') as jf:
+                                    existing = json.load(jf)
+                            except Exception:
+                                existing = {}
+                            # Each sweep uploads with its own metadata; 'organ' is
+                            # last-writer-wins, so keep an accumulating 'organs'
+                            # list recording every organ scanned in this study
+                            organs = set(existing.get('organs') or [])
+                            if existing.get('organ'):
+                                organs.add(existing['organ'])
+                            if r_d.get('organ'):
+                                organs.add(r_d['organ'])
+                            existing.update(r_d)
+                            existing['organs'] = sorted(organs)
+                            with open(json_path, 'w') as jf:
+                                json.dump(existing, jf, indent=4)
+                        else:
+                            r_d.setdefault('patientid', r_d.get('patientid', 'unknown'))
+                            r_d.setdefault('studyid', r_d.get('studyid', r_d.get('studyuuid', 'unknown')))
+                            r_d.setdefault('finished', False)
+                            if r_d.get('organ'):
+                                r_d['organs'] = [r_d['organ']]
+                            with open(json_path, 'w') as jf:
+                                json.dump(r_d, jf, indent=4)
+                        print(f"[WS] Received config from {remote}: patient={r_d.get('patientid')} study={r_d.get('studyid')}")
+                    except json.JSONDecodeError as e:
+                        print(f"[WS] Bad metadata JSON from {remote}: {e}")
+                        await websocket.send(json.dumps({"error": "invalid metadata"}))
+                        return
+                    continue
+
+                # Check for completion signal
+                if msg.lower().startswith('{') or msg.lower().startswith('['):
+                    try:
+                        parsed = json.loads(msg)
+                        if parsed.get('type') == 'complete':
+                            # Each sweep upload sends 'complete' on its own
+                            # connection; only the one flagged sessionComplete
+                            # (the last sweep) triggers processing + PACS send.
+                            # Older apps don't send the flag — process every time
+                            # like before.
+                            session_done = bool(r_d.get('sessioncomplete', True))
+                            print(f"[WS] Client {remote} marked complete ({images_processed} images, sessionComplete={session_done})")
+                            r_d['finished'] = session_done
+                            await process_batch(r_d, image_list, None)
+                            return
+                    except json.JSONDecodeError:
+                        pass
+
+                # Otherwise it's a filename
+                current_filename = msg
+                continue
+
+            # --- Binary messages: raw image data ---
+            if isinstance(raw_message, bytes):
+                if r_d is None:
+                    print(f"[WS] Received image before metadata from {remote}, dropping")
+                    continue
+
+                nparr = np.frombuffer(raw_message, np.uint8)
+                decoded = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if decoded is None:
+                    print(f"[WS] Failed to decode image from {remote}")
+                    await websocket.send(json.dumps({"status": "image_received"}))
+                    continue
+
+                # Filename from Android: "{organ}/{orientation}/{type}/{imagename}"
+                # e.g. "rightkidney/longitudinal/raw/20260611_175122_0000_p0.0_r0.0_y0.0.jpg"
+                # Older app versions send "{orientation}/{type}/{imagename}"; the
+                # organ then comes from this connection's metadata so right/left
+                # sweeps of the same study still land in separate folders.
+                img_organ = str(r_d.get('organ', '')).lower()
+                img_orientation = r_d.get('orientation', 'transverse')
+                img_type = 'raw'  # default
+                base_name = current_filename or ''
+                if current_filename and '/' in current_filename:
+                    parts_path = current_filename.split('/')
+                    if len(parts_path) >= 4:
+                        img_organ = parts_path[0]
+                        img_orientation = parts_path[1]
+                        img_type = parts_path[2]  # 'raw' or 'processed'
+                        base_name = parts_path[3]
+                    elif len(parts_path) == 3:
+                        img_orientation = parts_path[0]
+                        img_type = parts_path[1]  # 'raw' or 'processed'
+                        base_name = parts_path[2]
+                    elif len(parts_path) == 2:
+                        img_orientation = parts_path[0]
+                        base_name = parts_path[1]
+
+                organ_part = f"{img_organ}/" if img_organ else ""
+                fpath = f"{idir}/{r_d['patientid']}/{r_d['studyid']}/{organ_part}{img_orientation}/{img_type}"
+                os.makedirs(fpath, exist_ok=True)
+                fname = f"{fpath}/{base_name}"
+
+                cv2.imwrite(fname, decoded)
+
+                # Track filenames only — holding every decoded frame in memory
+                # costs gigabytes per session and the frames are never read
+                # again (processing re-reads from disk)
+                image_list.append(fname)
+                images_processed += 1
+                print(f"[WS] Image {images_processed} saved: {fname}")
+
+                # Ack so client sends next image
+                await websocket.send(json.dumps({"status": "image_received"}))
+                current_filename = None
+
+    except websockets.exceptions.ConnectionClosed as e:
+        print(f"[WS] Connection closed by client {remote}: {e}")
+    except Exception as e:
+        print(f"[WS] Error handling WebSocket from {remote}: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 async def handle_client(reader, writer):
@@ -816,8 +1161,15 @@ async def handle_client(reader, writer):
                                     existing = json.load(jf)
                             except Exception:
                                 existing = {}
-                            # Merge: update existing with keys from r_d
+                            # Merge: update existing with keys from r_d, keeping a
+                            # running list of every organ scanned in this study
+                            organs = set(existing.get('organs') or [])
+                            if existing.get('organ'):
+                                organs.add(existing['organ'])
+                            if r_d.get('organ'):
+                                organs.add(r_d['organ'])
                             existing.update(r_d)
+                            existing['organs'] = sorted(organs)
                             with open(json_path, 'w') as jf:
                                 json.dump(existing, jf, indent=4)
                         else:
@@ -882,8 +1234,11 @@ async def handle_client(reader, writer):
             await writer.drain()
             await process_batch(r_d, image_list, writer)
     
-    writer.close()
-    await writer.wait_closed()
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except ConnectionResetError:
+        pass
     print(f"Connection closed: {client_addr}")
 
 
@@ -908,25 +1263,84 @@ async def run_server():
                 except Exception as e:
                     print(f"Worker {worker_id} error processing {study_dir}: {e}")
             finally:
+                STUDIES_IN_FLIGHT.discard(study_dir)
                 try:
                     STUDY_QUEUE.task_done()
                 except Exception:
                     pass
 
-    # Launch workers
+    # Janitor: uploads can die mid-session (network drop), in which case the
+    # final sweep's sessionComplete never arrives and the study would sit
+    # unprocessed forever. Periodically pick up any study whose images have
+    # settled (no new files for a while) but which hasn't been sent to PACS
+    # since its newest image. Processing is idempotent (deterministic DICOM
+    # UIDs), so a later re-upload + reprocess just merges.
+    JANITOR_INTERVAL = 60          # seconds between scans
+    JANITOR_SETTLE_SECS = 180      # study must be quiet this long
+    JANITOR_RETRY_SECS = 900       # min gap between attempts per study
+    janitor_last_try = {}
+
+    async def _janitor():
+        print("Janitor started (recovers studies with interrupted uploads)")
+        while True:
+            await asyncio.sleep(JANITOR_INTERVAL)
+            try:
+                now = time.time()
+                for patient in os.listdir(idir):
+                    patient_dir = os.path.join(idir, patient)
+                    if not os.path.isdir(patient_dir):
+                        continue
+                    for study in os.listdir(patient_dir):
+                        study_dir = os.path.join(patient_dir, study)
+                        if not os.path.isdir(study_dir) or study_dir in STUDIES_IN_FLIGHT:
+                            continue
+                        if not os.path.exists(os.path.join(study_dir, 'study_info.json')):
+                            continue
+                        if now - janitor_last_try.get(study_dir, 0) < JANITOR_RETRY_SECS:
+                            continue
+                        newest = 0
+                        for root, dirs, files in os.walk(study_dir):
+                            for f in files:
+                                if f.lower().endswith(('.jpeg', '.jpg', '.png')):
+                                    try:
+                                        newest = max(newest, os.path.getmtime(os.path.join(root, f)))
+                                    except OSError:
+                                        pass
+                        if newest == 0 or now - newest < JANITOR_SETTLE_SECS:
+                            continue  # no images yet / still uploading
+                        flag = os.path.join(study_dir, 'pacs_sent.flag')
+                        if os.path.exists(flag) and os.path.getmtime(flag) >= newest:
+                            continue  # already fully handled
+                        if STUDY_QUEUE.full():
+                            continue
+                        janitor_last_try[study_dir] = now
+                        STUDIES_IN_FLIGHT.add(study_dir)
+                        await STUDY_QUEUE.put(study_dir)
+                        print(f"🧹 Janitor enqueued unfinished study: {study_dir}")
+            except Exception as e:
+                print(f"Janitor error: {e}")
+
+    # Launch workers + janitor
     for i in range(max(1, MAX_CONCURRENT_JOBS)):
         t = asyncio.create_task(_worker(i))
         WORKER_TASKS.append(t)
+    WORKER_TASKS.append(asyncio.create_task(_janitor()))
 
-    server = await asyncio.start_server(handle_client, HOST, PORT)
-    addr = server.sockets[0].getsockname()
-    print(f"PACS Transfer Server running on {addr}")
-    print(f"   Listening on {HOST}:{PORT}")
+    # Start TCP server (legacy protocol)
+    tcp_server = await asyncio.start_server(handle_client, HOST, PORT)
+    tcp_addr = tcp_server.sockets[0].getsockname()
+
+    # Start WebSocket server (Android app protocol)
+    ws_server = await websockets.serve(handle_websocket_client, HOST, WEBSOCKET_PORT)
+
+    print(f"PACS Transfer Server running")
+    print(f"   TCP  listening on {HOST}:{PORT} (legacy)")
+    print(f"   WS   listening on {HOST}:{WEBSOCKET_PORT} (Android)")
     print(f"   Images will be saved to: {idir}")
     print(f"   Press Ctrl+C to stop")
-    
-    async with server:
-        await server.serve_forever()
+
+    async with tcp_server, ws_server:
+        await asyncio.gather(tcp_server.serve_forever(), ws_server.wait_closed())
 
 
 if __name__ == "__main__":
