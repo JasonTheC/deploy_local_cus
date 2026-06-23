@@ -498,12 +498,25 @@ def send_to_pacs(study_dir, study_info):
         series_instance_uid = generate_uid(entropy_srcs=[str(study_uuid), series_name])
         series_description = series_name.replace('raw_', '').replace('_', ' ').replace('/', ' ').title()
 
-        # Current layout is "{organ}/{orientation}/{type}" — use just the organ
-        # for StudyDescription so each image is labelled with the kidney it's
-        # actually of, not every organ scanned in the whole study
-        series_organ_part = series_name.split('/')[0] if '/' in series_name else None
-        study_description = series_organ_part.replace('_', ' ').title() \
-            if series_organ_part else fallback_study_description
+        # Current layout is "{organ}/{orientation}/{type}" — build a
+        # "<Side> <Orientation> <Organ>" StudyDescription from this series'
+        # own folder (e.g. "Right Sagital Kidney") so each image is labelled
+        # with the side/axis/organ it's actually of, not every organ scanned
+        # in the whole study
+        series_path_parts = series_name.split('/')
+        if len(series_path_parts) >= 2:
+            organ_raw, orientation_raw = series_path_parts[0], series_path_parts[1]
+            side = ''
+            organ_name = organ_raw
+            for s in ('left', 'right'):
+                if organ_raw.startswith(s):
+                    side = s
+                    organ_name = organ_raw[len(s):]
+                    break
+            study_description = ' '.join(
+                w.title() for w in (side, orientation_raw, organ_name) if w)
+        else:
+            study_description = fallback_study_description
 
         print(f"Processing series: {series_description} ({len(img_paths)} images)")
         
