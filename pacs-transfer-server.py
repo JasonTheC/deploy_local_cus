@@ -695,8 +695,8 @@ async def process_study_async(study_dir):
         return side, target
 
     # Sweep axis folder names the app can produce. The non-transverse axis is
-    # "longitudinal" for kidneys and "sagital"/"sagittal" for pelvic organs.
-    AXIS_NAMES = ('transverse', 'sagital', 'sagittal', 'longitudinal')
+    # "sagital"/"sagittal" (spelling varies by app version).
+    AXIS_NAMES = ('transverse', 'sagital', 'sagittal')
 
     def axes_with_raw(parent_dir):
         """Maps axis name -> path (relative to study_dir) of its raw folder."""
@@ -717,7 +717,7 @@ async def process_study_async(study_dir):
 
     def make_job(side, target, axes):
         second_axis = next(
-            (a for a in ('sagital', 'sagittal', 'longitudinal') if a in axes), None)
+            (a for a in ('sagital', 'sagittal') if a in axes), None)
         return {
             'side': side,
             'target': target,
@@ -754,7 +754,7 @@ async def process_study_async(study_dir):
             lower = entry.lower()
             if 'transverse' in lower:
                 axes['transverse'] = entry
-            elif 'sagit' in lower or 'longitudinal' in lower:
+            elif 'sagit' in lower:
                 axes['sagital'] = entry
         for (side, target), axes in legacy_pairs.items():
             jobs.append(make_job(side, target, axes))
@@ -1067,7 +1067,7 @@ async def handle_websocket_client(websocket):
                     continue
 
                 # Filename from Android: "{organ}/{orientation}/{type}/{imagename}"
-                # e.g. "rightkidney/longitudinal/raw/20260611_175122_0000_p0.0_r0.0_y0.0.jpg"
+                # e.g. "rightkidney/sagital/raw/20260611_175122_0000_p0.0_r0.0_y0.0.jpg"
                 # Older app versions send "{orientation}/{type}/{imagename}"; the
                 # organ then comes from this connection's metadata so right/left
                 # sweeps of the same study still land in separate folders.

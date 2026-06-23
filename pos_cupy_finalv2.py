@@ -120,8 +120,8 @@ def process_images(r_d, img_array=None, flist=None):
         fpath = f'{base_study}/{r_d["actual_dir"]}/'
     else:
         # The second axis goes by several names depending on app version/organ
-        if orient in ('sagital', 'sagittal', 'longitudinal'):
-            orient_aliases = [orient] + [a for a in ('sagital', 'sagittal', 'longitudinal') if a != orient]
+        if orient in ('sagital', 'sagittal'):
+            orient_aliases = [orient] + [a for a in ('sagital', 'sagittal') if a != orient]
         else:
             orient_aliases = [orient]
 
@@ -269,7 +269,7 @@ def place_slice_in_volume(points, image_array, theta, center_x, center_y, center
         y_coords, x_coords = cp.where(mask)
         pixel_values = image_array_gpu[mask]
 
-        # Any non-transverse sweep (sagital/sagittal/longitudinal) uses the
+        # Any non-transverse sweep (sagital/sagittal) uses the
         # sagittal placement geometry
         if orientation != 'transverse':
             vol_x = cp.full_like(x_coords, center_x)
@@ -515,7 +515,7 @@ def process_study(r_common):
     print(f"Processing {patient_id}/{study_id}/{side}{target}")
     print(f"{'='*60}")
     
-    # Second axis: "sagital" for pelvic organs, "longitudinal" for kidneys.
+    # Second axis is always "sagital" (spelling varies by app version).
     # The label drives the output filename; geometry treats anything
     # non-transverse as a sagittal-style sweep.
     second_axis = r_common.get('second_axis') or 'sagital'
