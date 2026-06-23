@@ -45,7 +45,7 @@ services:
       - "8042:8042"
     volumes:
       - ./orthanc.json:/etc/orthanc/orthanc.json:ro
-      - orthanc-db:/var/lib/orthanc/db
+      - orthanc-db:/var/lib/orthanc/db-v6
     restart: unless-stopped
     networks:
       - cus-net
