@@ -369,6 +369,71 @@ def store_to_node(node, generated_dcms):
     return not failures
 
 
+def calibrate_from_depth_ruler(gray, depth_mm):
+    """
+    Derive mm-per-pixel from the on-screen depth ruler drawn in the left margin
+    of sector/endocavity frames (the prostate scans).
+
+    The ruler has long major ticks every 10 mm alternating with shorter minor
+    ticks every 5 mm. We locate the tick dashes in the left margin, separate the
+    long (major) ticks by dash length, and take the median spacing between
+    consecutive major ticks as "pixels per 10 mm". This is immune to the black
+    margins and the grayscale bar on the right edge that previously inflated the
+    calibration height (full-image bounding box) and made every measurement read
+    ~7% short (e.g. 13.9 cm for a 15 cm scan).
+
+    Returns mm-per-pixel as a float, or None if no usable ruler is found (e.g.
+    the curvilinear kidney frames, which carry no ruler) so the caller can fall
+    back to the bounding-box estimate.
+    """
+    h, w = gray.shape
+    # Ticks live in the left margin; scan a generous left band (relative to
+    # width, since the probe stream can change resolution mid-sweep).
+    band = gray[:, :max(8, int(0.15 * w))]
+    bright_rows = np.where(band.max(axis=1) > 100)[0]
+    if len(bright_rows) < 6:
+        return None
+
+    # Group adjacent bright rows into individual tick dashes.
+    ticks = []  # (center_row, dash_length_px)
+    start = prev = bright_rows[0]
+    for r in list(bright_rows[1:]) + [None]:
+        if r is None or r - prev > 3:
+            seg = band[start:prev + 1]
+            cols = np.where(seg.max(axis=0) > 100)[0]
+            if len(cols) >= 2:
+                ticks.append(((start + prev) / 2.0, cols[-1] - cols[0] + 1))
+            if r is None:
+                break
+            start = r
+        prev = r
+    if len(ticks) < 3:
+        return None
+
+    centers = np.array([t[0] for t in ticks])
+    lengths = np.array([t[1] for t in ticks])
+    # Major (numbered, 10 mm) ticks are the longest dashes. If every dash is the
+    # same length (only major ticks drawn) this keeps them all.
+    major = centers[lengths >= 0.75 * lengths.max()]
+    if len(major) < 2:
+        return None
+
+    px_per_10mm = float(np.median(np.diff(np.sort(major))))
+    if px_per_10mm <= 0:
+        return None
+
+    mm_per_px = 10.0 / px_per_10mm
+
+    # Sanity check against the reported depth: the number of 10 mm major ticks
+    # should be about depth/10 + 1. If it's wildly off, the detection latched
+    # onto something that isn't the ruler — bail to the fallback.
+    if depth_mm:
+        expected_majors = depth_mm / 10.0 + 1
+        if not (expected_majors - 2 <= len(major) <= expected_majors + 2):
+            return None
+    return mm_per_px
+
+
 def send_to_pacs(study_dir, study_info):
     """
     Generate DICOMs for a study and replicate them to every configured PACS
@@ -489,8 +554,14 @@ def send_to_pacs(study_dir, study_info):
         organs = [study_info['organ']]
     fallback_study_description = ', '.join(str(o).title() for o in organs)[:64]
 
-    # Get depth from study info (in cm)
-    depth_cm = study_info.get('depth', 15)
+    # Get imaging depth from study info. The app writes 'scandepthmm' /
+    # 'scandepthcm' (NOT 'depth'), so the old study_info.get('depth', 15) always
+    # silently fell back to 15 cm and ignored the real scan depth.
+    depth_mm = study_info.get('scandepthmm')
+    if depth_mm is None:
+        depth_alt = study_info.get('scandepthcm', study_info.get('depth'))
+        depth_mm = float(depth_alt) * 10.0 if depth_alt is not None else 150.0
+    depth_mm = float(depth_mm)
 
     # StudyDescription is a single, study-level value shared by every series,
     # so it must describe the whole exam — not one sweep. Use the organs list
@@ -581,15 +652,21 @@ def send_to_pacs(study_dir, study_info):
                 image_2d = image_2d + 1.0
             image_2d = ((image_2d / image_2d.max()) * 255).astype(np.uint8)
 
-            # Calculate live pixel region (excluding black borders)
-            non_zero_rows = np.any(image_2d > image_2d.min() + 1, axis=1)
-            row_indices = np.where(non_zero_rows)[0]
-            if len(row_indices) > 0:
-                live_pixel_height = row_indices[-1] - row_indices[0] + 1
-            else:
-                live_pixel_height = image_2d.shape[0]
-            # Calculate pixel spacing: depth_cm / live_pixel_height (convert cm to mm)
-            pixel_spacing_mm = (depth_cm * 10.0) / live_pixel_height
+            # Preferred: derive mm/pixel from the on-screen depth ruler. This is
+            # the device's own ground-truth scale and avoids the bounding-box
+            # error below (overlays/grayscale bar inflate the height -> distances
+            # read short, e.g. 13.9 cm for a 15 cm scan).
+            pixel_spacing_mm = calibrate_from_depth_ruler(image_2d, depth_mm)
+            if pixel_spacing_mm is None:
+                # Fallback for rulerless frames (curvilinear kidney scans): map
+                # the full scan depth across the live (non-black) pixel rows.
+                non_zero_rows = np.any(image_2d > image_2d.min() + 1, axis=1)
+                row_indices = np.where(non_zero_rows)[0]
+                if len(row_indices) > 0:
+                    live_pixel_height = row_indices[-1] - row_indices[0] + 1
+                else:
+                    live_pixel_height = image_2d.shape[0]
+                pixel_spacing_mm = depth_mm / live_pixel_height
             
             ds.SamplesPerPixel = 1
             ds.PhotometricInterpretation = 'MONOCHROME2'
