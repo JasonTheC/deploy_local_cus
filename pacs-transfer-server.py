@@ -384,16 +384,18 @@ def send_to_pacs(study_dir, study_info):
 
     print(f"Study info: {json.dumps(study_info, indent=2)}")
 
-    # Collect image files grouped into one series per raw/processed leaf folder.
+    # Collect image files grouped into one series per raw leaf folder.
+    # Only the raw sweep frames are sent to PACS — the 'processed'/'colour'
+    # derivatives are intermediate artefacts and must not become DICOMs.
     # Layouts handled:
-    #   {study_dir}/{organ}/{orientation}/raw|processed/*.jpg  (current app)
-    #   {study_dir}/{orientation}/raw|processed/*.jpg          (older app)
+    #   {study_dir}/{organ}/{orientation}/raw/*.jpg  (current app)
+    #   {study_dir}/{orientation}/raw/*.jpg          (older app)
     # The series key is the folder path relative to the study dir, e.g.
     # "rightkidney/transverse/raw", so right and left kidney never merge.
     series_images = {}  # Key: series name, Value: list of image paths
 
     for root, dirs, files in os.walk(study_dir):
-        if os.path.basename(root) not in ('raw', 'processed'):
+        if os.path.basename(root) != 'raw':
             continue
         series_key = os.path.relpath(root, study_dir).replace(os.sep, '/')
         for file in files:
