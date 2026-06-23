@@ -480,13 +480,13 @@ def send_to_pacs(study_dir, study_info):
     study_instance_uid = study_info.get('studyinstanceuid') \
         or (generate_uid(entropy_srcs=[str(study_uuid)]) if study_uuid else generate_uid())
 
-    # Study description lists every organ scanned in this study (the single
-    # 'organ' field is last-writer-wins when multiple organs share a study)
+    # Fallback study description (used only when a series' own organ can't be
+    # determined from its folder path, e.g. legacy raw_* layout)
     organs = study_info.get('organs') or []
     if not organs and study_info.get('organ'):
         organs = [study_info['organ']]
-    study_description = ', '.join(str(o).title() for o in organs)[:64]
-    
+    fallback_study_description = ', '.join(str(o).title() for o in organs)[:64]
+
     # Get depth from study info (in cm)
     depth_cm = study_info.get('depth', 15)
 
@@ -497,7 +497,14 @@ def send_to_pacs(study_dir, study_info):
         # same study merges in PACS instead of duplicating every series
         series_instance_uid = generate_uid(entropy_srcs=[str(study_uuid), series_name])
         series_description = series_name.replace('raw_', '').replace('_', ' ').replace('/', ' ').title()
-        
+
+        # Current layout is "{organ}/{orientation}/{type}" — use just the organ
+        # for StudyDescription so each image is labelled with the kidney it's
+        # actually of, not every organ scanned in the whole study
+        series_organ_part = series_name.split('/')[0] if '/' in series_name else None
+        study_description = series_organ_part.replace('_', ' ').title() \
+            if series_organ_part else fallback_study_description
+
         print(f"Processing series: {series_description} ({len(img_paths)} images)")
         
         # Sort images naturally (by timestamp in filename)

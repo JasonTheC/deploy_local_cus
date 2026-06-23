@@ -178,6 +178,25 @@ setup_dirs() {
   touch "$SCRIPT_DIR/CUS.db" 2>/dev/null || true
 }
 
+# ── Remove stale containers that would block startup ───────
+# The compose services use fixed container_name values, so a container
+# left over from an earlier run (e.g. the folder was renamed, changing the
+# Compose project name) collides by name and "docker compose down" in this
+# project can't see it. Force-remove any such leftovers before starting.
+clean_conflicts() {
+  local names=(cus-backend cus-orthanc cus-ohif cus-nifti-viewer)
+  local stale=()
+  for n in "${names[@]}"; do
+    if docker ps -a --format '{{.Names}}' | grep -qx "$n"; then
+      stale+=("$n")
+    fi
+  done
+  if [ ${#stale[@]} -gt 0 ]; then
+    echo "▶ Removing stale containers: ${stale[*]}"
+    docker rm -f "${stale[@]}" >/dev/null 2>&1 || true
+  fi
+}
+
 # ── Build and start ────────────────────────────────────────
 deploy() {
   echo ""
@@ -197,7 +216,8 @@ deploy() {
   compose build backend --quiet 2>/dev/null || compose build backend
 
   echo "▶ Starting containers…"
-  compose up -d
+  clean_conflicts
+  compose up -d --remove-orphans
 
   verify_services
 
@@ -273,7 +293,8 @@ show_status() {
 stop() {
   cd "$SCRIPT_DIR"
   echo "▶ Stopping all services…"
-  compose down
+  compose down --remove-orphans
+  clean_conflicts
   echo "✓ All containers stopped."
 }
 
