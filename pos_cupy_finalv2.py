@@ -80,28 +80,45 @@ def run_inference_batch(model, images, device, target_size=256, batch_size=32):
 
     return np.concatenate(mask_chunks), np.concatenate(conf_chunks)
 
+def _gpu_has_free(nbytes, factor=1.5):
+    """True if the GPU currently has at least nbytes*factor free.
+
+    Used to decide, per heavy operation, whether to run on the GPU or fall back
+    to host RAM. This lets the same code run well on an 8 GB card with lots of
+    system RAM (offload big temporaries to the CPU) and on a 16 GB card (keep
+    them on the GPU) — i.e. process wherever there's actually room.
+    """
+    try:
+        free_b, _ = cp.cuda.Device().mem_info
+        return nbytes * factor < free_b
+    except Exception:
+        return False
+
+
 def get_bounds(a):
-    """Fast bounds calculation using CuPy"""
-    # Convert to CuPy if numpy
-    if isinstance(a, np.ndarray):
-        a_gpu = cp.asarray(a)
-    else:
-        a_gpu = a
-    
-    if not a_gpu.any():
-        return (0, a_gpu.shape[0]-1, 0, a_gpu.shape[1]-1, 0, a_gpu.shape[2]-1)
-    
-    x_any = a_gpu.any(axis=(1,2))
-    y_any = a_gpu.any(axis=(0,2))
-    z_any = a_gpu.any(axis=(0,1))
-    
-    ux = int(cp.argmax(x_any).get())
-    bx = int(len(x_any) - cp.argmax(x_any[::-1]).get() - 1)
-    uy = int(cp.argmax(y_any).get())
-    by = int(len(y_any) - cp.argmax(y_any[::-1]).get() - 1)
-    uz = int(cp.argmax(z_any).get())
-    bz = int(len(z_any) - cp.argmax(z_any[::-1]).get() - 1)
-    
+    """Find the nonzero bounding box — on the GPU when the volume comfortably
+    fits in free VRAM, otherwise on the CPU.
+
+    Only cheap per-axis any() reductions are needed; the costly part was copying
+    a multi-GB volume onto the GPU (cp.asarray), which OOM'd 8 GB cards on the
+    1620³ volume when ~4 GB was already resident. The reduction results are tiny,
+    so we pull them to the CPU and finish there regardless of device.
+    """
+    if isinstance(a, np.ndarray) and _gpu_has_free(a.nbytes):
+        a = cp.asarray(a)
+    on_gpu = not isinstance(a, np.ndarray)
+
+    if not bool(a.any()):
+        return (0, a.shape[0]-1, 0, a.shape[1]-1, 0, a.shape[2]-1)
+
+    x_any = cp.asnumpy(a.any(axis=(1, 2))) if on_gpu else a.any(axis=(1, 2))
+    y_any = cp.asnumpy(a.any(axis=(0, 2))) if on_gpu else a.any(axis=(0, 2))
+    z_any = cp.asnumpy(a.any(axis=(0, 1))) if on_gpu else a.any(axis=(0, 1))
+
+    ux = int(np.argmax(x_any)); bx = int(len(x_any) - np.argmax(x_any[::-1]) - 1)
+    uy = int(np.argmax(y_any)); by = int(len(y_any) - np.argmax(y_any[::-1]) - 1)
+    uz = int(np.argmax(z_any)); bz = int(len(z_any) - np.argmax(z_any[::-1]) - 1)
+
     return (ux, bx, uy, by, uz, bz)
 
 def zero_trim_ndarray(ndarray):
@@ -400,7 +417,11 @@ def get_voxel(patient_data, r_d, img_array, flist):
             continue
         
         place_slice_in_volume(points, img_gray, theta, center_x, center_y, center_z, s, orientation)
-    
+
+    # Release the per-slice GPU temporaries the CuPy pool cached during the build
+    # (these stay reserved and OOM the trim/gap-fill on small cards otherwise).
+    cp.get_default_memory_pool().free_all_blocks()
+
     # Trim
     print("Trimming volume...")
     points = zero_trim_ndarray(points)
@@ -488,19 +509,31 @@ def get_voxel(patient_data, r_d, img_array, flist):
     # process on memory-constrained boxes (e.g. 15 GB host). Falls back to CPU
     # only if the GPU path is genuinely unavailable.
     print("Applying smoothing to remove pixelation...")
-    try:
-        import cupyx.scipy.ndimage as _cupy_ndimage
-        pts_gpu = cp.asarray(points)
-        mask_gpu = pts_gpu > 0
-        blurred_gpu = _cupy_ndimage.gaussian_filter(pts_gpu.astype(cp.float32), sigma=0.8)
-        points = cp.where(mask_gpu, blurred_gpu, 0).astype(cp.uint8).get()
-        del pts_gpu, mask_gpu, blurred_gpu
-        cp.get_default_memory_pool().free_all_blocks()
-    except Exception as e:
-        print(f"  GPU smoothing unavailable ({e}); falling back to CPU")
+    # The float32 working copy + gaussian output dominate memory (~9x the uint8
+    # volume). Run on the GPU only when that comfortably fits in free VRAM,
+    # otherwise on the CPU (host RAM) — so an 8 GB card with plenty of system
+    # RAM stays off the GPU here while a 16 GB card keeps it on-device.
+    def _smooth_cpu():
         mask = points > 0
         blurred = gaussian_filter(points.astype(np.float32), sigma=0.8)
-        points = np.where(mask, blurred, 0).astype(np.uint8)
+        return np.where(mask, blurred, 0).astype(np.uint8)
+
+    if _gpu_has_free(points.nbytes * 9):
+        try:
+            import cupyx.scipy.ndimage as _cupy_ndimage
+            pts_gpu = cp.asarray(points)
+            mask_gpu = pts_gpu > 0
+            blurred_gpu = _cupy_ndimage.gaussian_filter(pts_gpu.astype(cp.float32), sigma=0.8)
+            points = cp.where(mask_gpu, blurred_gpu, 0).astype(cp.uint8).get()
+            del pts_gpu, mask_gpu, blurred_gpu
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception as e:
+            print(f"  GPU smoothing failed ({e}); falling back to CPU")
+            cp.get_default_memory_pool().free_all_blocks()
+            points = _smooth_cpu()
+    else:
+        print("  Insufficient free VRAM — smoothing on CPU")
+        points = _smooth_cpu()
 
     # The fan apex (probe axis) comes out at the bottom — flip so it sits on top.
     print("Orienting probe-apex axis to top...")
