@@ -481,12 +481,26 @@ def get_voxel(patient_data, r_d, img_array, flist):
         
         print(f"Gap fill done in {it + 1} iteration(s)")
     
-    # Apply gentle blur to remove pixelated look without creating artifacts
+    # Apply gentle blur to remove pixelated look without creating artifacts.
+    # Run on the GPU (cupyx) so the float32 working copies live in VRAM, not
+    # host RAM. The CPU/scipy path allocated TWO full float32 volumes on the
+    # host (the .astype copy + the gaussian output) and OOM-killed the whole
+    # process on memory-constrained boxes (e.g. 15 GB host). Falls back to CPU
+    # only if the GPU path is genuinely unavailable.
     print("Applying smoothing to remove pixelation...")
-    # Use scipy (CPU) to avoid CuPy compilation issues
-    mask = points > 0
-    blurred = gaussian_filter(points.astype(np.float32), sigma=0.8)
-    points = np.where(mask, blurred, 0).astype(np.uint8)
+    try:
+        import cupyx.scipy.ndimage as _cupy_ndimage
+        pts_gpu = cp.asarray(points)
+        mask_gpu = pts_gpu > 0
+        blurred_gpu = _cupy_ndimage.gaussian_filter(pts_gpu.astype(cp.float32), sigma=0.8)
+        points = cp.where(mask_gpu, blurred_gpu, 0).astype(cp.uint8).get()
+        del pts_gpu, mask_gpu, blurred_gpu
+        cp.get_default_memory_pool().free_all_blocks()
+    except Exception as e:
+        print(f"  GPU smoothing unavailable ({e}); falling back to CPU")
+        mask = points > 0
+        blurred = gaussian_filter(points.astype(np.float32), sigma=0.8)
+        points = np.where(mask, blurred, 0).astype(np.uint8)
 
     # The fan apex (probe axis) comes out at the bottom — flip so it sits on top.
     print("Orienting probe-apex axis to top...")
@@ -621,7 +635,7 @@ def process_all_patients(base_dir=mdir):
                 proc_sub = os.path.join(study_path, d, 'processed')
                 if os.path.isdir(raw_sub) or os.path.isdir(proc_sub):
                     low = d.lower()
-                    if 'sagital' in low:
+                    if 'sagital' in low or 'sagittal' in low or 'longitud' in low:
                         new_orientations.setdefault('sagital', True)
                     elif 'transverse' in low:
                         new_orientations.setdefault('transverse', True)

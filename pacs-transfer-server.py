@@ -664,6 +664,38 @@ def send_to_pacs(study_dir, study_info):
 
 
 
+def _newest_image_mtime(study_dir):
+    """Most recent mtime of any image in the study (0 if none)."""
+    newest = 0
+    for root, dirs, files in os.walk(study_dir):
+        for f in files:
+            if f.lower().endswith(('.jpeg', '.jpg', '.png')):
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(root, f)))
+                except OSError:
+                    pass
+    return newest
+
+
+def _flag_current(study_dir, flag_name, newest=None):
+    """True if <flag_name> exists and is at least as new as the newest image.
+
+    Each processing stage has its own flag (pacs_sent.flag for the C-STORE,
+    3d_recon.flag for the 3D reconstruction) so they can be retried
+    independently — a study whose DICOMs were sent but whose reconstruction
+    failed still gets picked up again by the janitor.
+    """
+    flag = os.path.join(study_dir, flag_name)
+    if not os.path.exists(flag):
+        return False
+    if newest is None:
+        newest = _newest_image_mtime(study_dir)
+    try:
+        return os.path.getmtime(flag) >= newest
+    except OSError:
+        return False
+
+
 async def process_study_async(study_dir):
     """
     Process a complete study: create 3D volume and send to PACS.
@@ -681,9 +713,16 @@ async def process_study_async(study_dir):
     with open(json_path, 'r') as f:
         study_info = json.load(f)
     
+    newest_img = _newest_image_mtime(study_dir)
     loop = asyncio.get_event_loop()
-    pacs_result = await loop.run_in_executor(None, send_to_pacs, study_dir, study_info)
-   
+
+    # PACS C-STORE — skip if the study was already sent since its newest image
+    # (its own flag), so a recon-only retry doesn't re-transmit every instance.
+    if _flag_current(study_dir, 'pacs_sent.flag', newest_img):
+        print(f"PACS send already current — skipping for {study_dir}")
+    else:
+        pacs_result = await loop.run_in_executor(None, send_to_pacs, study_dir, study_info)
+
     # Extract patient and study IDs
     patient_id = study_info.get('patientid', 'unknown')
     study_id = study_info.get('studyid', study_info.get('studyuuid', 'unknown'))
@@ -707,8 +746,11 @@ async def process_study_async(study_dir):
         return side, target
 
     # Sweep axis folder names the app can produce. The non-transverse axis is
-    # "sagital"/"sagittal" (spelling varies by app version).
-    AXIS_NAMES = ('transverse', 'sagital', 'sagittal')
+    # "sagital"/"sagittal"/"longitudinal" — the name varies by app version and
+    # organ; kidney sweeps in particular arrive as "longitudinal". If it isn't
+    # listed here the folder is ignored, no job is built, and the study is
+    # silently skipped for 3D reconstruction.
+    AXIS_NAMES = ('transverse', 'sagital', 'sagittal', 'longitudinal')
 
     def axes_with_raw(parent_dir):
         """Maps axis name -> path (relative to study_dir) of its raw folder."""
@@ -729,7 +771,7 @@ async def process_study_async(study_dir):
 
     def make_job(side, target, axes):
         second_axis = next(
-            (a for a in ('sagital', 'sagittal') if a in axes), None)
+            (a for a in ('sagital', 'sagittal', 'longitudinal') if a in axes), None)
         return {
             'side': side,
             'target': target,
@@ -766,50 +808,71 @@ async def process_study_async(study_dir):
             lower = entry.lower()
             if 'transverse' in lower:
                 axes['transverse'] = entry
-            elif 'sagit' in lower:
+            elif 'sagit' in lower or 'longitud' in lower:
                 axes['sagital'] = entry
         for (side, target), axes in legacy_pairs.items():
             jobs.append(make_job(side, target, axes))
 
     print(f"Reconstruction jobs: {jobs}")
 
-    # Process each organ separately (e.g., left kidney, right kidney)
-    for job in jobs:
-        side, target = job['side'], job['target']
-        print(f"\n{'='*60}")
-        print(f"Processing: patient={patient_id}, study={study_id}, target={target}, side={side}")
-        print(f"{'='*60}")
+    # 3D reconstruction is gated by its OWN flag (3d_recon.flag), kept separate
+    # from pacs_sent.flag. This is what lets a study whose DICOMs were already
+    # sent but whose reconstruction failed (e.g. a transient GPU/host OOM) get
+    # retried by the janitor without re-sending to PACS.
+    if _flag_current(study_dir, '3d_recon.flag', newest_img):
+        print(f"3D reconstruction already current — skipping for {study_dir}")
+    else:
+        recon_ok = True
+        # Process each organ separately (e.g., left kidney, right kidney)
+        for job in jobs:
+            side, target = job['side'], job['target']
+            print(f"\n{'='*60}")
+            print(f"Processing: patient={patient_id}, study={study_id}, target={target}, side={side}")
+            print(f"{'='*60}")
 
-        r_common = {
-            'patientid': patient_id,
-            'studyid': study_id,
-            'target': target,
-            'side': side,
-            'studies': {},
-            'sagital_dir': job['sagital_dir'],
-            'transverse_dir': job['transverse_dir'],
-            'second_axis': job['second_axis'],
-        }
+            r_common = {
+                'patientid': patient_id,
+                'studyid': study_id,
+                'target': target,
+                'side': side,
+                'studies': {},
+                'sagital_dir': job['sagital_dir'],
+                'transverse_dir': job['transverse_dir'],
+                'second_axis': job['second_axis'],
+            }
 
-        print("Passing to CuPy-accelerated 3D reconstruction...")
-        loop = asyncio.get_event_loop()
-        try:
-            await loop.run_in_executor(None, process_study_cupy, r_common)
-            print(f"✓ 3D reconstruction completed for {side}{target}")
-        except Exception as e:
-            print(f"✗ 3D reconstruction failed for {side}{target}: {e}")
-            import traceback
-            traceback.print_exc()
-            # Also persist the traceback into the study folder (mounted on the
-            # host) so failures are debuggable without docker access
+            print("Passing to CuPy-accelerated 3D reconstruction...")
+            loop = asyncio.get_event_loop()
             try:
-                with open(os.path.join(study_dir, 'processing_error.log'), 'a') as ef:
-                    ef.write(f"\n[{datetime.datetime.now().isoformat()}] "
-                             f"reconstruction failed for {side}{target}:\n")
-                    ef.write(traceback.format_exc())
-            except Exception:
-                pass
-    
+                await loop.run_in_executor(None, process_study_cupy, r_common)
+                print(f"✓ 3D reconstruction completed for {side}{target}")
+            except Exception as e:
+                recon_ok = False
+                print(f"✗ 3D reconstruction failed for {side}{target}: {e}")
+                import traceback
+                traceback.print_exc()
+                # Also persist the traceback into the study folder (mounted on the
+                # host) so failures are debuggable without docker access
+                try:
+                    with open(os.path.join(study_dir, 'processing_error.log'), 'a') as ef:
+                        ef.write(f"\n[{datetime.datetime.now().isoformat()}] "
+                                 f"reconstruction failed for {side}{target}:\n")
+                        ef.write(traceback.format_exc())
+                except Exception:
+                    pass
+
+        # Flag the study reconstructed only once every organ succeeded (an empty
+        # job list counts as done — there is nothing to reconstruct). A partial
+        # failure leaves the flag unwritten so the janitor retries later.
+        if recon_ok:
+            recon_flag = f"{study_dir}/3d_recon.flag"
+            with open(recon_flag, 'w') as f:
+                f.write(datetime.datetime.now().isoformat())
+            print(f"✅ Wrote 3D recon flag {recon_flag}")
+        else:
+            print("✗ One or more reconstructions failed — NOT writing 3d_recon.flag "
+                  "(janitor will retry)")
+
     print(f"\n✓ All processing completed for {patient_id}/{study_id}")
     return True
    
@@ -1330,18 +1393,17 @@ async def run_server():
                             continue
                         if now - janitor_last_try.get(study_dir, 0) < JANITOR_RETRY_SECS:
                             continue
-                        newest = 0
-                        for root, dirs, files in os.walk(study_dir):
-                            for f in files:
-                                if f.lower().endswith(('.jpeg', '.jpg', '.png')):
-                                    try:
-                                        newest = max(newest, os.path.getmtime(os.path.join(root, f)))
-                                    except OSError:
-                                        pass
+                        newest = _newest_image_mtime(study_dir)
                         if newest == 0 or now - newest < JANITOR_SETTLE_SECS:
                             continue  # no images yet / still uploading
-                        flag = os.path.join(study_dir, 'pacs_sent.flag')
-                        if os.path.exists(flag) and os.path.getmtime(flag) >= newest:
+                        # Re-enqueue if EITHER the PACS send or the 3D
+                        # reconstruction is missing/stale relative to the newest
+                        # image. Tracked by separate flags so a failed
+                        # reconstruction is retried even when the DICOMs were
+                        # already sent (and vice-versa).
+                        pacs_done = _flag_current(study_dir, 'pacs_sent.flag', newest)
+                        recon_done = _flag_current(study_dir, '3d_recon.flag', newest)
+                        if pacs_done and recon_done:
                             continue  # already fully handled
                         if STUDY_QUEUE.full():
                             continue
