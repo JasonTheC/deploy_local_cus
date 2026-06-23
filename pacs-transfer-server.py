@@ -490,19 +490,31 @@ def send_to_pacs(study_dir, study_info):
     # Get depth from study info (in cm)
     depth_cm = study_info.get('depth', 15)
 
+    # StudyDescription is a single, study-level value shared by every series,
+    # so it must describe the whole exam — not one sweep. Use the organs list
+    # (falling back to the organs seen across the series folders).
+    if fallback_study_description:
+        study_description = fallback_study_description
+    else:
+        seen = []
+        for sk in series_images:
+            organ0 = sk.split('/')[0]
+            if organ0 and organ0 not in seen:
+                seen.append(organ0)
+        study_description = ', '.join(o.title() for o in seen)[:64] or 'Ultrasound'
+
     # Process each series separately
     generated_dcms = []
     for series_name, img_paths in series_images.items():
         # Deterministic SeriesInstanceUID per (study, folder) so re-sending the
         # same study merges in PACS instead of duplicating every series
         series_instance_uid = generate_uid(entropy_srcs=[str(study_uuid), series_name])
-        series_description = series_name.replace('raw_', '').replace('_', ' ').replace('/', ' ').title()
-
         # Current layout is "{organ}/{orientation}/{type}" — build a
-        # "<Side> <Orientation> <Organ>" StudyDescription from this series'
-        # own folder (e.g. "Right Sagital Kidney") so each image is labelled
-        # with the side/axis/organ it's actually of, not every organ scanned
-        # in the whole study
+        # "<Side> <Orientation> <Organ>" label from this series' own folder
+        # (e.g. "Right Transverse Kidney"). Side/axis/organ vary *per series*,
+        # so this belongs in SeriesDescription — putting it in StudyDescription
+        # (a single study-level value) collapsed every series to one label,
+        # e.g. all showing "Left Sagital Kidney".
         series_path_parts = series_name.split('/')
         if len(series_path_parts) >= 2:
             organ_raw, orientation_raw = series_path_parts[0], series_path_parts[1]
@@ -513,10 +525,10 @@ def send_to_pacs(study_dir, study_info):
                     side = s
                     organ_name = organ_raw[len(s):]
                     break
-            study_description = ' '.join(
+            series_description = ' '.join(
                 w.title() for w in (side, orientation_raw, organ_name) if w)
         else:
-            study_description = fallback_study_description
+            series_description = series_name.replace('raw_', '').replace('_', ' ').replace('/', ' ').title()
 
         print(f"Processing series: {series_description} ({len(img_paths)} images)")
         
