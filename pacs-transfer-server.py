@@ -434,6 +434,55 @@ def calibrate_from_depth_ruler(gray, depth_mm):
     return mm_per_px
 
 
+def fov_axial_height(gray, bg_thresh=6):
+    """
+    Axial (vertical) pixel extent of the imaged field of view, agnostic to
+    vendor and probe geometry (linear box or curvilinear/sector fan). The FOV
+    is everything that isn't the near-black background, so the scan depth maps
+    directly onto its vertical span.
+
+    Robustness:
+      * a small intensity floor (not min+1) ignores JPEG ringing in the black
+        border that otherwise inflates the FOV to the whole frame;
+      * only the largest connected component is kept, dropping burned-in text,
+        the grayscale bar and stray specks;
+      * enclosed holes are filled, so anechoic structures inside the tissue
+        (bladder, cysts, vessels) can't carve a false top/bottom end;
+      * the extent is taken down the central columns — for a fan the lateral
+        shoulders sit above the apex, so a corner-to-corner box reads tall and
+        makes distances read short (the old 13.9-for-15 cm error); for a linear
+        probe the centre equals the box, so this stays correct either way.
+    """
+    if gray.ndim == 3:
+        gray = gray.mean(axis=2).astype(np.uint8)
+    mask = (gray > bg_thresh).astype(np.uint8)
+    if not mask.any():
+        return gray.shape[0]
+
+    # Keep the largest connected component (the imaged sector/box).
+    n, lbl, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if n > 2:  # >1 foreground label besides background(0)
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        mask = (lbl == largest).astype(np.uint8)
+
+    # Fill enclosed holes. Pad first so a FOV that touches the frame edge still
+    # has an outside background to flood from.
+    h, w = mask.shape
+    padded = np.zeros((h + 2, w + 2), np.uint8)
+    padded[1:-1, 1:-1] = mask
+    flood = padded.copy()
+    cv2.floodFill(flood, np.zeros((h + 4, w + 4), np.uint8), (0, 0), 1)
+    holes = (flood[1:-1, 1:-1] == 0) & (mask == 0)
+    mask[holes] = 1
+
+    # Axial extent down the central columns.
+    cx = w // 2
+    rows = np.where(mask[:, max(0, cx - 2):cx + 3].any(axis=1))[0]
+    if len(rows) == 0:
+        rows = np.where(mask.any(axis=1))[0]
+    return int(rows[-1] - rows[0] + 1)
+
+
 def send_to_pacs(study_dir, study_info):
     """
     Generate DICOMs for a study and replicate them to every configured PACS
@@ -607,7 +656,22 @@ def send_to_pacs(study_dir, study_info):
         
         # Sort images naturally (by timestamp in filename)
         img_paths = natsorted(img_paths)
-        
+
+        # Geometry-agnostic mm/pixel for this series, used when a frame has no
+        # printed depth ruler. Take the median FOV scale over the whole sweep so
+        # a frame where an anechoic structure touches the FOV edge (a false end)
+        # is rejected as an outlier rather than skewing the calibration.
+        series_fov_spacing = None
+        spacings = []
+        for p in img_paths:
+            g = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+            if g is not None:
+                fh = fov_axial_height(g)
+                if fh > 0:
+                    spacings.append(depth_mm / fh)
+        if spacings:
+            series_fov_spacing = float(np.median(spacings))
+
         for instance_number, img_path in enumerate(img_paths, start=1):
             img = cv2.imread(img_path)
             if img is None:
@@ -658,15 +722,12 @@ def send_to_pacs(study_dir, study_info):
             # read short, e.g. 13.9 cm for a 15 cm scan).
             pixel_spacing_mm = calibrate_from_depth_ruler(image_2d, depth_mm)
             if pixel_spacing_mm is None:
-                # Fallback for rulerless frames (curvilinear kidney scans): map
-                # the full scan depth across the live (non-black) pixel rows.
-                non_zero_rows = np.any(image_2d > image_2d.min() + 1, axis=1)
-                row_indices = np.where(non_zero_rows)[0]
-                if len(row_indices) > 0:
-                    live_pixel_height = row_indices[-1] - row_indices[0] + 1
-                else:
-                    live_pixel_height = image_2d.shape[0]
-                pixel_spacing_mm = depth_mm / live_pixel_height
+                # No printed ruler (e.g. curvilinear kidney/Clarius frames):
+                # use the geometry-agnostic FOV scale computed across the whole
+                # sweep, falling back to this frame's own FOV if the sweep pass
+                # produced nothing.
+                pixel_spacing_mm = (series_fov_spacing if series_fov_spacing
+                                    else depth_mm / fov_axial_height(image_2d))
             
             ds.SamplesPerPixel = 1
             ds.PhotometricInterpretation = 'MONOCHROME2'
